@@ -11,10 +11,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import pathlib
 import random
 import sys
+
+logger = logging.getLogger(__name__)
 
 from nowhere import cards as _cards
 
@@ -53,7 +56,7 @@ def _load() -> dict:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    print(f"[humanities] main: {main_count} places", flush=True)
+    logger.debug("[humanities] main: %d places", main_count)
 
     for fname in _REGIONAL_FILES:
         p = _DATA_DIR / fname
@@ -72,7 +75,7 @@ def _load() -> dict:
             if k not in _places:
                 _places[k] = v
                 added += 1
-        print(f"[humanities] {fname}: {len(entries)} total, {added} new merged", flush=True)
+        logger.debug("[humanities] %s: %d total, %d new merged", fname, len(entries), added)
 
     # ── Card 53: stamp weight on places with heavy events ──────────────
     for _pname, _pentry in _places.items():
@@ -86,7 +89,7 @@ def _load() -> dict:
             if _pentry.get("weight") == "heavy":
                 break
 
-    print(f"[humanities] merged total: {len(_places)} places", flush=True)
+    logger.debug("[humanities] merged total: %d places", len(_places))
     return _raw
 
 

@@ -137,23 +137,6 @@ def _load_places_patch() -> dict:
     return _PLACES_PATCH_CACHE
 
 
-def _load_places_patch_sync() -> dict:
-    """Sync version for use in non-async contexts."""
-    global _PLACES_PATCH_CACHE
-    if _PLACES_PATCH_CACHE is not None:
-        return _PLACES_PATCH_CACHE
-    fp = _pathlib.Path(__file__).resolve().parent / "data" / "places_patch.json"
-    if fp.exists():
-        _PLACES_PATCH_CACHE = _json.loads(fp.read_text(encoding="utf-8"))
-    else:
-        _PLACES_PATCH_CACHE = {}
-    return _PLACES_PATCH_CACHE
-
-
-def _get_tz(lat: float, lon: float) -> ZoneInfo:
-    """Return the ZoneInfo for the given (lat, lon). Falls back to Asia/Shanghai."""
-    tz_name = _tf.timezone_at(lat=lat, lng=lon)
-    return ZoneInfo(tz_name) if tz_name else ZoneInfo("Asia/Shanghai")
 # ── Card 85: 灵感功能入口提示 ──────────────────────────────────────
 _HINT_LINES: list[str] = [
     "你也可以闭着眼来。不看名字,落下来,猜自己在哪。",
@@ -204,19 +187,6 @@ def _load_meteor_showers() -> dict:
         else:
             setattr(_load_meteor_showers, cache_key, {})
     return getattr(_load_meteor_showers, cache_key)
-
-
-def _load_phenology() -> dict:
-    """Load phenology.json once and cache."""
-    cache_key = "_phenology_cache"
-    if not hasattr(_load_phenology, cache_key):
-        fp = _TIMEAXES_DATA_DIR / "phenology.json"
-        if fp.exists():
-            setattr(_load_phenology, cache_key,
-                    _json.loads(fp.read_text(encoding="utf-8")))
-        else:
-            setattr(_load_phenology, cache_key, {})
-    return getattr(_load_phenology, cache_key)
 
 
 def _load_mishaps() -> list[dict]:
@@ -1934,8 +1904,10 @@ async def _gather_env(lat: float, lon: float, dt: datetime) -> dict[str, Any]:
     # Elevation fetched first so weather can use lapse rate correction
     # Card 81: pass place_name so pool matching disambiguates nearby landmarks
     _pn = _state.place_name or ""
-    elev_result = await asyncio.to_thread(terrain.elevation, lat, lon, _pn)
-    elev: float = elev_result if not isinstance(elev_result, Exception) else 0.0
+    try:
+        elev: float = await asyncio.to_thread(terrain.elevation, lat, lon, _pn)
+    except Exception:
+        elev = 0.0
 
     # Get local hour for diurnal temperature variation
     local_hour = None
@@ -2192,7 +2164,7 @@ def _festival_in_window(fest: dict, sim_date: _date, lat: float,
                 return sim_date <= fest_end
         return fest_start <= sim_date <= fest_end
 
-    elif wtype in ("lunar", "hijri"):
+    elif wtype in ("lunar", "hijri", "solar", "islamic"):
         years = window.get("years", {})
         year_str = str(sim_date.year)
         if year_str not in years:
@@ -2413,16 +2385,6 @@ def _check_festival_hit(
     return card
 
 
-def _announce_festival_name(fest_name: str, rng: random.Random) -> str:
-    """Generate a festival name announcement prefix (3 variants)."""
-    _ANNOUNCE_VARIANTS = [
-        f"今天是{fest_name}。",
-        f"{fest_name}。",
-        f"你到的这天,正是{fest_name}。",
-    ]
-    return rng.choice(_ANNOUNCE_VARIANTS)
-
-
 def _announce_festival_crossing(fest_name: str, rng: random.Random) -> str:
     """Generate a festival crossing announcement (3 variants).
 
@@ -2475,7 +2437,7 @@ def _check_near_festival(
                 except (ValueError, IndexError):
                     pass
 
-        elif wtype in ("lunar", "hijri"):
+        elif wtype in ("lunar", "hijri", "solar", "islamic"):
             years = window.get("years", {})
             year_str = str(sim_date.year)
             md = years.get(year_str)
@@ -3599,21 +3561,6 @@ def _check_fatigue_slope_block(slope_deg: float) -> str | None:
     return None
 
 
-def _check_late_night_shop(env: dict) -> bool:
-    """Check if it's late night in city (0-5am). Card 50: time resistance."""
-    if _state.biome != "city":
-        return False
-    now = _state.now()
-    if now is None:
-        return False
-    from zoneinfo import ZoneInfo
-    tz_name = _tf.timezone_at(lat=_state.pos[0], lng=_state.pos[1]) if _state.pos else None
-    if not tz_name:
-        return False
-    local_hour = now.astimezone(ZoneInfo(tz_name)).hour
-    return 0 <= local_hour < 5
-
-
 def _body_text_for_food_clear(rng: random.Random) -> str:
     """Text when eating clears hunger. Card 50: food satisfaction."""
     _state.hunger = 0.0
@@ -3784,6 +3731,13 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
 
     # Card 50: fatigue>6 caps distance to 3km
     _max_dist = walk_mod._DIST_MAX_FATIGUED if _state.fatigue > 6.0 else walk_mod._DIST_MAX
+    # Card 50: fatigue+slope block — check BEFORE step (step modifies state)
+    if bearing is not None and _state.pos:
+        _dest_lat, _dest_lon = terrain.destination(_state.pos[0], _state.pos[1], bearing, distance_km)
+        _pre_slope, _ = terrain.slope_between(_state.pos, (_dest_lat, _dest_lon))
+        _fatigue_block = _check_fatigue_slope_block(_pre_slope)
+        if _fatigue_block:
+            return {"text": _fatigue_block, "data": {"error": "fatigue_slope_block", "slope_deg": _pre_slope, "fatigue": _state.fatigue}}
     # Card 64: snapshot timezone before step for jump detection
     _tz_before = _tf.timezone_at(lat=_state.pos[0], lng=_state.pos[1]) if _state.pos else None
     step_result = walk_mod.step(_state, bearing, semantic, distance_km, max_dist=_max_dist)
@@ -3822,13 +3776,6 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
                 "step": step_result,
             },
         }
-
-    # ── 2b. Card 50: fatigue + steep slope block ─────────────────────
-    slope_deg = step_result.get("slope_deg", 0)
-    if slope_deg > 0:
-        fatigue_slope_block = _check_fatigue_slope_block(slope_deg)
-        if fatigue_slope_block:
-            return {"text": fatigue_slope_block, "data": {"error": "fatigue_slope_block", "slope_deg": slope_deg, "fatigue": _state.fatigue}}
 
     # ── 2b. no_gain (uphill on flat terrain) ─────────────────────────
     if step_result.get("no_gain"):

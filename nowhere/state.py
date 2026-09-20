@@ -286,7 +286,6 @@ class WorldState:
                 pass
             msg = f"存档读不出来,已备份到 {backup.name},旅程重新开始"
             logging.getLogger(__name__).warning("%s (%s)", msg, exc)
-            print(msg)
             return None
 
     def clear(self) -> None:

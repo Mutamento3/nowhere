@@ -96,8 +96,8 @@ def _climate_fallback(lat: float, lon: float, elevation: float | None = None,
     temp = _CLIMATE_TEMP[zone][month - 1]  # list is 0-indexed, month is 1-indexed
     # Diurnal (day/night) temperature variation
     if local_hour is not None:
-        # Peak at 14:00, trough at 05:00
-        # Amplitude: ±8°C for lowlands, ±12°C for deserts
+        # Trough at 05:00, peak at ~11:00 (sine wave, period=24h)
+        # Amplitude: ±12°C for equator/subtropical, ±8°C for temperate
         amplitude = 12.0 if zone in ("equator", "subtropical") else 8.0
         hour_angle = (local_hour - 5) * (2 * math.pi / 24)  # trough at 5am
         temp += amplitude * math.sin(hour_angle)

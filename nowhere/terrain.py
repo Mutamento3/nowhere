@@ -133,18 +133,9 @@ def _find_tile(lat: float, lon: float) -> dict | None:
 
     # First pass: check bounds from the index (no tile load needed)
     for key, info in index.items():
-        if "lat_min" not in info:
-            # Bounds not preloaded — load the full tile to check
-            tile = _load_tile(info["fname"])
-            if tile is None:
-                continue
-            if (tile["lat_min"] <= lat <= tile["lat_max"] and
-                    tile["lon_min"] <= lon <= tile["lon_max"]):
-                return tile
-        else:
-            if (info["lat_min"] <= lat <= info["lat_max"] and
-                    info["lon_min"] <= lon <= info["lon_max"]):
-                return _load_tile(info["fname"])
+        if (info["lat_min"] <= lat <= info["lat_max"] and
+                info["lon_min"] <= lon <= info["lon_max"]):
+            return _load_tile(info["fname"])
 
     return None
 

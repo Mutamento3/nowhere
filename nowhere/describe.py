@@ -510,11 +510,11 @@ def _matches(requires: dict, ctx: dict) -> bool:
             return False
 
     # Temperature constraints
-    if "temp_min" in requires:
-        if (ctx.get("temp") or 999) < requires["temp_min"]:
+    temp = ctx.get("temp")
+    if temp is not None:
+        if "temp_min" in requires and temp < requires["temp_min"]:
             return False
-    if "temp_max" in requires:
-        if (ctx.get("temp") or -999) > requires["temp_max"]:
+        if "temp_max" in requires and temp > requires["temp_max"]:
             return False
 
     return True
@@ -1380,9 +1380,9 @@ def _scene_for_kind(kind: str, payload: dict, rng: random.Random,
     surface = payload.get("surface", "")
 
     if kind == "terrain":
-        # Skip scene files when payload has specific numeric data --
+        # Skip scene files when payload has non-zero numeric data --
         # scene files are literary and don't embed numbers like elevation.
-        if "elevation" in payload or "slope_deg" in payload:
+        if payload.get("elevation", 0) > 0 or payload.get("slope_deg", 0) > 0:
             return None
         # At high altitude, terrain is specific -- don't use generic scenes
         if elevation and elevation > 3000:

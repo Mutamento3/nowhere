@@ -29,10 +29,6 @@ _LAT_LIMIT_CLOSINGS = [
 ]
 
 
-def _clamp_dist(dist_km: float) -> float:
-    return max(_DIST_MIN, min(_DIST_MAX, dist_km))
-
-
 def _bearing_from_path(path: list[dict]) -> float:
     """Compute bearing from the last two path points, or default north."""
     if len(path) < 2:
@@ -97,7 +93,7 @@ def water_ahead_km(lat: float, lon: float, bearing_deg: float, max_km: float = 2
     d = 1.0
     while d <= max_km:
         lat2, lon2 = terrain.destination(lat, lon, bearing_deg, d)
-        if terrain.surface(lat2, lon2) == "water_ocean":
+        if terrain.is_water(lat2, lon2):
             # Card 64: coarse-grid false-ocean gate.  Real ocean is at sea
             # level; "water_ocean" above 1000 m is a grid artifact.
             if terrain.elevation(lat2, lon2) > 1000:

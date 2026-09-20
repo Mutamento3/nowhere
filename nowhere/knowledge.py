@@ -170,7 +170,7 @@ def _format_kb_entry(name: str, entry: dict | str) -> dict:
     }
 
 
-async def about(lat: float, lon: float, topic: str) -> dict | None:
+async def about(lat: float, lon: float, topic: str, rng: random.Random | None = None) -> dict | None:
     """Return a knowledge result from the local KB, or *None*.
 
     Parameters
@@ -182,6 +182,8 @@ async def about(lat: float, lon: float, topic: str) -> dict | None:
     title = topic.strip() if topic else ""
     place_name = ""
 
+    if rng is None:
+        rng = random.Random(hash((lat, lon, topic)))
     kb = _load_local_kb()
 
     # ── 1. Exact match ──
@@ -224,14 +226,14 @@ async def about(lat: float, lon: float, topic: str) -> dict | None:
                         for label in target_labels:
                             if label in city_entry and city_entry[label]:
                                 # Return random entry from this category
-                                pick = _random.choice(city_entry[label])
+                                pick = rng.choice(city_entry[label])
                                 return {"title": f"{place_name}·{label}", "extract": pick, "url": "", "source": "ask_city"}
                     # 2. Try partial match (e.g., "北京市" → "北京")
                     for city_name, city_entry in _city_data.items():
                         if city_name in place_name or place_name in city_name:
                             for label in target_labels:
                                 if label in city_entry and city_entry[label]:
-                                    pick = _random.choice(city_entry[label])
+                                    pick = rng.choice(city_entry[label])
                                     return {"title": f"{city_name}·{label}", "extract": pick, "url": "", "source": "ask_city"}
                 break
 
@@ -269,22 +271,28 @@ async def _resolve_place_name(lat: float, lon: float) -> str:
 
 def _get_chinese_name(eng_name: str) -> str:
     """Look up Chinese name from places.db alts column."""
+    import sqlite3
+    db = None
     try:
-        import sqlite3
         db = sqlite3.connect(_DATA / "places.db", timeout=5)
         row = db.execute(
             "SELECT alts FROM places WHERE name = ? AND fclass = 'P' LIMIT 1",
             (eng_name,)
         ).fetchone()
-        db.close()
         if row and row[0]:
             for alt in row[0].split(","):
                 alt = alt.strip()
                 # Chinese characters (CJK Unified Ideographs)
                 if alt and all('一' <= c <= '鿿' for c in alt):
                     return alt
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("_get_chinese_name failed for %s: %s", eng_name, e)
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
     return ""
 
 

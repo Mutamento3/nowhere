@@ -182,7 +182,7 @@ def _weather_word(weather: dict | None) -> str:
     return "晴天"
 
 
-def _time_word(dt: datetime | None, lat: float = 30.0) -> str:
+def _time_word(dt: datetime | None, lat: float = 30.0, lon: float = 120.0) -> str:
     """时段→适合填进模板的词。"""
     if dt is None:
         return "傍晚"
@@ -190,7 +190,7 @@ def _time_word(dt: datetime | None, lat: float = 30.0) -> str:
         from timezonefinder import TimezoneFinder
         from zoneinfo import ZoneInfo
         tf = TimezoneFinder()
-        tz_name = tf.timezone_at(lat=lat, lng=0)
+        tz_name = tf.timezone_at(lat=lat, lng=lon)
         if tz_name:
             dt = dt.astimezone(ZoneInfo(tz_name))
     except Exception:
@@ -252,6 +252,7 @@ def _generate_first_impression(
     name: str,
     env: dict | None,
     lat: float = 30.0,
+    lon: float = 120.0,
 ) -> str | None:
     """从变体池生成初见印象。env 里有时用 env,没有就用默认值。"""
     pool = _VARIANT_POOLS.get(volume)
@@ -267,7 +268,7 @@ def _generate_first_impression(
         dt = datetime.now(timezone.utc)
 
     w_word = _weather_word(weather)
-    t_word = _time_word(dt, lat)
+    t_word = _time_word(dt, lat, lon)
     a_word = _action_word(weather, t_word)
 
     template = rng.choice(pool)
@@ -337,9 +338,10 @@ def record_with_env(
     place: str,
     env: dict | None,
     lat: float = 30.0,
+    lon: float = 120.0,
 ) -> None:
     """记录一笔,自动生成 first_impression。"""
-    fi = _generate_first_impression(volume, name, env, lat)
+    fi = _generate_first_impression(volume, name, env, lat, lon)
     record(volume, name, place, fi)
 
 
@@ -427,7 +429,7 @@ def _render_overview() -> str:
         if first_at:
             try:
                 dt = datetime.fromisoformat(first_at)
-                lat = 30.0  # 默认纬度
+                lat = 30.0  # TODO: pass actual lat from caller; default is ~mid-latitude China
                 first_season = _compute_season(dt.month, lat)
             except Exception:
                 pass

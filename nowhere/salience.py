@@ -21,13 +21,6 @@ from typing import Any
 
 # ── Card 69: Situation — runtime context for content filtering ──────────
 
-_LAT_BANDS_MAP = [
-    (66, 90, "polar"),
-    (35, 66, "north_temperate"),
-    (-35, 35, "tropics"),
-    (-90, -35, "south_temperate"),
-]
-
 _CLIMATE_ZONES = [
     (60, 90, "寒带"),
     (40, 60, "温带"),
@@ -127,7 +120,12 @@ class Situation:
             return True
 
         # No payload = can't check = pass
-        if not payload or not isinstance(payload, dict):
+        if not payload:
+            return True
+        # water_features arrives as list[dict]; extract first element for filtering
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        if not isinstance(payload, dict):
             return True
 
         # ── radio: country code ──

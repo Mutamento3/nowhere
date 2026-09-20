@@ -24,6 +24,15 @@ def _db() -> sqlite3.Connection:
     return _conn
 
 
+def pools() -> list[dict]:
+    """Return list of registered pools with metadata."""
+    conn = _db()
+    rows = conn.execute(
+        "SELECT name, entry_points, reader, description FROM pools"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def cards(pool: str, key: str | None = None,
           subkey: str | None = None) -> list[dict]:
     """Return list of {text, constraints} dicts for the given pool/key/subkey."""
