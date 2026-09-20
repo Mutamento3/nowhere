@@ -28,12 +28,7 @@ _EARTH_RADIUS_KM: Final = 6371.0
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+from nowhere.terrain import haversine_km as _haversine_km
 
 
 def _load_fallback() -> list[dict]:

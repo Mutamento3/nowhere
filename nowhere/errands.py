@@ -76,13 +76,11 @@ def take_letter(letter: dict, sim_time: datetime) -> dict:
     }
 
 
+from nowhere.terrain import haversine_km as _haversine_km_raw
+
 def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
-    """Haversine distance in km."""
-    lat1, lon1, lat2, lon2 = map(math.radians, (a[0], a[1], b[0], b[1]))
-    d = (math.sin((lat2 - lat1) / 2) ** 2
-         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
-    d = min(d, 1.0)  # float-point safety: asin argument must be <= 1.0
-    return 2 * 6371.0 * math.asin(math.sqrt(d))
+    """Haversine distance in km (tuple wrapper around terrain.haversine_km)."""
+    return _haversine_km_raw(a[0], a[1], b[0], b[1])
 
 
 def check_delivery(pos: tuple[float, float], errand: dict,

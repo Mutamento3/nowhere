@@ -37,15 +37,7 @@ _WATER_TO_TYPE: dict[str, str] = {
 }
 
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Haversine distance in km."""
-    rlat1, rlon1 = math.radians(lat1), math.radians(lon1)
-    rlat2, rlon2 = math.radians(lat2), math.radians(lon2)
-    dlat = rlat2 - rlat1
-    dlon = rlon2 - rlon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
-    a = min(a, 1.0)  # clamp for floating-point safety on antipodal points
-    return 6371.0 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+from nowhere.terrain import haversine_km as _haversine_km
 
 
 def _bearing_label(lat1: float, lon1: float, lat2: float, lon2: float) -> str:

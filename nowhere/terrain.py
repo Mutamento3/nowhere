@@ -318,6 +318,10 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(a))
 
 
+# Public alias for cross-module use (A1: single source of truth)
+haversine_km = _haversine_km
+
+
 # ── Public API ──────────────────────────────────────────────────────
 
 def elevation(lat: float, lon: float, place_name: str = "") -> float:

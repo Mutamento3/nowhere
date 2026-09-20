@@ -261,10 +261,4 @@ async def marine_life(lat: float, lon: float, rng: random.Random, *, biome: str 
     return _offline_marine(lat, rng)
 
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    a = min(a, 1.0)
-    return 2 * 6371.0 * math.asin(math.sqrt(a))
+from nowhere.terrain import haversine_km as _haversine_km

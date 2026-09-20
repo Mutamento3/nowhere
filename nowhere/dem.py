@@ -48,14 +48,7 @@ def _load_cities_dem() -> list[tuple[float, float, float]]:
     return _cities_dem
 
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Haversine distance in km."""
-    lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    a = min(a, 1.0)
-    return 2 * 6371.0 * math.asin(math.sqrt(a))
+from nowhere.terrain import haversine_km as _haversine_km
 
 
 def lookup(lat: float, lon: float) -> float | None:

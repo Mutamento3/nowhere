@@ -124,12 +124,7 @@ def _get_cards() -> list[_cards.Card]:
     return _hu_cards
 
 
-def _haversine_km(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
-    """Haversine distance in km."""
-    lat1, lon1, lat2, lon2 = map(math.radians, (a_lat, a_lon, b_lat, b_lon))
-    a = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
-    a = min(a, 1.0)
-    return 2 * 6371.0 * math.asin(math.sqrt(a))
+from nowhere.terrain import haversine_km as _haversine_km
 
 
 def _resolve(place_name: str | None) -> str | None:

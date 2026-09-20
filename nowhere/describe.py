@@ -1423,9 +1423,6 @@ def _scene_for_kind(kind: str, payload: dict, rng: random.Random,
     elif kind == "weather":
         precip = payload.get("precip", "none")
         scene_name = _WEATHER_TO_SCENE.get(precip, "")
-        # At high altitude, don't use water/river scenes
-        if elevation and elevation > 3000 and scene_name in ("water",):
-            return None
     elif kind == "water":
         # Skip scene files when payload has specific temperature data
         if "sea_surface_temp" in payload or "sst" in payload:
@@ -2753,18 +2750,11 @@ def render_establish(payload: dict, rng: random.Random) -> str:
 
     if precip in _WEATHER_TO_SCENE:
         scene_name = _WEATHER_TO_SCENE[precip]
-        # At high altitude, skip water/river scenes
-        if elevation and elevation > 3000 and scene_name in ("water",):
-            pass
-        else:
-            scene_pool = _load_scenes(scene_name)
+        scene_pool = _load_scenes(scene_name)
     if not scene_pool and biome in _BIOME_TO_SCENE:
         scene_name = _BIOME_TO_SCENE[biome]
-        # Biome guard: don't use water scenes at high altitude
-        if elevation and elevation > 3000 and scene_name in ("water",):
-            pass
         # Biome guard: city biome should only use urban scenes
-        elif biome == "city" and scene_name != "urban":
+        if biome == "city" and scene_name != "urban":
             pass
         # Biome guard: mountain+rock should only use mountain scenes
         elif biome == "mountain" and surface == "rock" and scene_name not in ("mountains",):
@@ -2919,16 +2909,11 @@ def _geocode_segment(seg_name: str) -> tuple[float, float] | None:
     return result
 
 
+from nowhere.terrain import haversine_km as _haversine_km_raw
+
 def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
-    """Haversine distance in km between two (lat, lon) tuples."""
-    import math
-    R = 6371.0
-    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
-    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h))
+    """Haversine distance in km (tuple wrapper around terrain.haversine_km)."""
+    return _haversine_km_raw(a[0], a[1], b[0], b[1])
 
 
 # ── handler registry ─────────────────────────────────────────────────

@@ -455,7 +455,11 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
         "西北太平洋": ("CN", "TW", "JP", "KR", "PH", "VN", "HK", "MO"),
         "北大西洋": ("US", "MX", "CU", "JM", "HT", "DO", "PR", "BS"),
     }
-    _ARID_COUNTRIES = ("PE", "CL", "NA", "AO", "EG", "SA", "YE", "OM")
+    _ARID_COUNTRIES_FULL = (
+        "PE", "CL", "NA", "AO", "EG", "SA", "YE", "OM",
+        "IR", "AF", "UZ", "TM", "KG", "TJ", "PK",
+        "DZ", "MA", "LY", "JO", "SY", "IQ", "EH",
+    )
     raw_candidates: list[tuple[str, str | None]] = []
     for e in month_events:
         cons = e.get("constraints") or {}
@@ -478,7 +482,7 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
         _h = cons.get("humidity")
         if _h == "arid" and biome != "desert":
             cc_chk = country.country_code_of(lat, lon)
-            if cc_chk not in _ARID_COUNTRIES:
+            if cc_chk not in _ARID_COUNTRIES_FULL:
                 continue
         # Card 81: max_elev — skip tree/forest cards above treeline
         me = cons.get("max_elev")
@@ -536,14 +540,9 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
             raw_candidates.append((e["text"], cons.get("humidity")))
 
     # Card 74/79: arid filtering — exclude humid cards for arid locations
-    _ARID_COUNTRIES = (
-        "PE", "CL", "NA", "AO", "EG", "SA", "YE", "OM",
-        "IR", "AF", "UZ", "TM", "KG", "TJ", "PK",
-        "DZ", "MA", "LY", "JO", "SY", "IQ", "EH",
-    )
     if band in ("tropical", "sub") and biome in ("coast", "desert"):
         cc_now = country.country_code_of(lat, lon)
-        if cc_now in _ARID_COUNTRIES:
+        if cc_now in _ARID_COUNTRIES_FULL:
             arid_filtered = [(t, h) for t, h in raw_candidates if h != "humid"]
             if arid_filtered:
                 raw_candidates = arid_filtered
@@ -670,7 +669,6 @@ def _get_weekday_rhythm(dt: datetime, lat: float, lon: float,
 
     # Sunday morning (6-12): regional variants
     if wd == 6 and 6 <= hour < 12:
-        cc = country.country_code_of(lat, lon)
         region = describe._get_region(lat, lon)
         if region in ("east_asia",):
             return rng.choice(_WEEKDAY_SUNDAY_MORNING["east_asia"])
@@ -692,7 +690,6 @@ def _get_weekday_rhythm(dt: datetime, lat: float, lon: float,
                 ld = lunar["lunar_day"]
                 # 一四七/二五八/三六九 pattern (last digit of lunar day)
                 last_digit = ld % 10
-                market_groups = {1: [1, 4, 7], 2: [2, 5, 8], 3: [3, 6, 9]}
                 # Use place hash to assign market group
                 is_market_day = last_digit in (1, 4, 7)  # default group
                 if is_market_day and 8 <= hour < 14:
@@ -1177,14 +1174,7 @@ def _compute_wilderness_depth_km(lat: float, lon: float) -> float:
     Uses explorable_index.json places and hydrology offline water features.
     Returns 0.0 if within 5km of any known feature, otherwise the distance.
     """
-    from math import radians, sin, cos, sqrt, atan2
-
-    def _haversine_km(lat1, lon1, lat2, lon2):
-        R = 6371.0
-        dlat = radians(lat2 - lat1)
-        dlon = radians(lon2 - lon1)
-        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+    _haversine_km = terrain.haversine_km
 
     min_dist = float("inf")
 
@@ -1300,14 +1290,7 @@ def _force_content(
 
 def _find_nearby_destinations(lat: float, lon: float, rng) -> str:
     """Return a literary hint about a walkable place within ~20km."""
-    from math import radians, sin, cos, sqrt, atan2
-
-    def _haversine_km(lat1, lon1, lat2, lon2):
-        R = 6371.0
-        dlat = radians(lat2 - lat1)
-        dlon = radians(lon2 - lon1)
-        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+    _haversine_km = terrain.haversine_km
 
     try:
         places = _load_places_patch()
@@ -6639,12 +6622,13 @@ def main() -> None:
         help="启动网页旁观者 (不给端口=自动选端口；--web 8080=指定端口)",
     )
     parser.add_argument("--web-only", type=int, default=None, help="Web observer port (standalone, no MCP)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Bind host (127.0.0.1=localhost only, 0.0.0.0=all interfaces)")
     args = parser.parse_args()
 
     if args.web_only is not None:
         import uvicorn
         from nowhere.web import app as web_app
-        uvicorn.run(web_app, host="0.0.0.0", port=args.web_only, log_level="info")
+        uvicorn.run(web_app, host=args.host, port=args.web_only, log_level="info")
     elif args.web is not None:
         import socket
         import sys as _sys
@@ -6688,7 +6672,7 @@ def main() -> None:
         print(f"[nowhere] web observer ready: {web_url}", file=_sys.stderr)
 
         async def _run_with_web() -> None:
-            config = uvicorn.Config(web_app, host="0.0.0.0", port=port, log_level="warning")
+            config = uvicorn.Config(web_app, host=args.host, port=port, log_level="warning")
             server = uvicorn.Server(config)
             web_task = asyncio.create_task(server.serve())
             web_task.add_done_callback(lambda t: t.result() if not t.cancelled() else None)
