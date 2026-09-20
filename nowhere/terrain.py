@@ -90,7 +90,7 @@ def _load_tile_index() -> dict[str, dict]:
                     entry["lon_min"] = float(data["lon_min"])
                     entry["lon_max"] = float(data["lon_max"])
             except Exception:
-                continue
+                continue  # intentionally ignored: per-tile tolerance, skip corrupt/missing tiles
         _TILE_INDEX[key] = entry
     return _TILE_INDEX
 
@@ -106,7 +106,7 @@ def _load_tile(fname: str) -> dict | None:
     try:
         data = np.load(path)
     except Exception:
-        return None
+        return None  # intentionally ignored: tile load failure, caller handles None
     tile = {
         "elev": data["elev"],
         "surface": data["surface"],
@@ -224,7 +224,7 @@ def _load_cities() -> list[tuple[float, float]]:
                     if int(parts[14] or 0) >= 50000:
                         _cities.append((float(parts[4]), float(parts[5])))
                 except ValueError:
-                    continue
+                    continue  # intentionally ignored: malformed city data line
     return _cities
 
 

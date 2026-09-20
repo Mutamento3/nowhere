@@ -81,7 +81,7 @@ def _load() -> list[_cards.Card]:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
-        pass
+        pass  # intentionally ignored: stdout reconfigure may fail on some terminals
 
     _lc_cards = _cards.load_localcolor(_DATA_DIR)
 
@@ -143,6 +143,9 @@ def draw(
     has_local_food = False
     for c in handwritten_cards:
         cat = c.meta.get("category", "")
+        # 节律卡由 rhythm_event() 单独处理,不进普通池
+        if cat == "节律":
+            continue
         w = c.meta.get("weight", 1.0)
         if not _conditions_pass(c, local_hour=local_hour, month=month, weekday=weekday):
             continue

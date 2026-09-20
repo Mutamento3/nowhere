@@ -55,7 +55,7 @@ def _load() -> dict:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
-        pass
+        pass  # intentionally ignored: stdout reconfigure may fail on some terminals
     logger.debug("[humanities] main: %d places", main_count)
 
     for fname in _REGIONAL_FILES:

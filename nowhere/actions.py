@@ -239,7 +239,7 @@ class EncounterAction:
                     "fauna", fauna_name, ctx.state.place_name or "", nb_env, ctx.lat,
                 )
         except Exception:
-            pass
+            pass  # intentionally ignored: notebook recording is non-critical
         return enc
 
 
@@ -450,7 +450,7 @@ class LocalSceneAction:
                             nb_env["_dt"] = now
                             notebook_mod.record_with_env("flora", flora, place, nb_env, lat)
                 except Exception:
-                    pass
+                    pass  # intentionally ignored: notebook recording is non-critical
 
         # 1b. Trace (Card 16: blind时禁抽, traces contain place-specific details)
         _blind = getattr(ctx.state, "blind", False)

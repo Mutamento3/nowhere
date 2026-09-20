@@ -65,12 +65,20 @@ async def generate(
         await asyncio.wait_for(proc.wait(), timeout=180)
         return proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 10_000
     except Exception:
-        # 失败清理半成品
+        # 超时或失败:先杀子进程,再清理半成品
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass  # intentionally ignored: proc.kill() during cleanup
         try:
             if out_path.exists():
                 out_path.unlink()
         except OSError:
-            pass
+            pass  # intentionally ignored: cleanup of half-built poster file
         return False
 
 

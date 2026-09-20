@@ -77,11 +77,11 @@ def sun_moon(lat: float, lon: float, dt: datetime) -> dict:
     try:
         sunrise_iso = _to_iso(obs.previous_rising(ephem.Sun()))
     except (ephem.NeverUpError, ephem.AlwaysUpError):
-        pass
+        pass  # intentionally ignored: polar regions where sun never rises/sets is normal
     try:
         sunset_iso = _to_iso(obs.next_setting(ephem.Sun()))
     except (ephem.NeverUpError, ephem.AlwaysUpError):
-        pass
+        pass  # intentionally ignored: polar regions where sun never sets is normal
 
     # ── moon ────────────────────────────────────────────────────────
     moon = ephem.Moon(obs)

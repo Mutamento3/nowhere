@@ -191,7 +191,11 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
         return _format_kb_entry(title, kb[title])
 
     # ── 2. Bidirectional substring (卡88) ──
-    if title:
+    # Skip if the query contains a topic word (历史/美食/地标/…);
+    # let step 4 (topic mapping) handle it instead, so that
+    # "故宫的历史" returns history content rather than a raw 故宫 entry.
+    _has_topic_word = any(tw in title for tw in _TOPIC_LABELS)
+    if title and not _has_topic_word:
         idx = _kb_char_index or {}
         # Forward: "故宫有什么" contains "故宫" → match
         for ch in set(title):
@@ -207,7 +211,6 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
     # ── 3. Entity extraction: find KB keys mentioned in topic (卡88) ──
     # Only match keys >= 3 chars to avoid false positives
     # Skip if topic contains a topic word (美食/历史/地标 etc.) — let step 4 handle it
-    _has_topic_word = any(tw in title for tw in _TOPIC_LABELS)
     if title and not _has_topic_word:
         for name in sorted(kb.keys(), key=len, reverse=True):
             if len(name) >= 3 and name in title:
@@ -292,7 +295,7 @@ def _get_chinese_name(eng_name: str) -> str:
             try:
                 db.close()
             except Exception:
-                pass
+                pass  # intentionally ignored: db.close() cleanup failure is harmless
     return ""
 
 

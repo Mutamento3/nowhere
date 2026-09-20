@@ -44,7 +44,7 @@ def _load_cities_dem() -> list[tuple[float, float, float]]:
                 if dem > 0:
                     _cities_dem.append((lat, lon, dem))
             except (ValueError, IndexError):
-                continue
+                continue  # intentionally ignored: malformed DEM data line
     return _cities_dem
 
 

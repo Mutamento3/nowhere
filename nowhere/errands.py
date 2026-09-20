@@ -73,6 +73,8 @@ def take_letter(letter: dict, sim_time: datetime) -> dict:
         "hint": letter["hint"],
         "text": letter["text"],
         "taken_at": sim_time.isoformat(),
+        "dest_lat": letter.get("dest_lat"),
+        "dest_lon": letter.get("dest_lon"),
     }
 
 
@@ -93,10 +95,26 @@ def check_delivery(pos: tuple[float, float], errand: dict,
     """
     if errand.get("kind") != "letter":
         return None
+    # 优先用目的地坐标校验(从 take_letter 传入)
+    dlat = errand.get("dest_lat")
+    dlon = errand.get("dest_lon")
+    if dlat is not None and dlon is not None:
+        if _haversine_km(pos, (dlat, dlon)) <= radius_km:
+            # 在目的地附近,返回最近的地名
+            best_name, best_d = None, float("inf")
+            for name, coords in place_coords.items():
+                d = _haversine_km(pos, coords)
+                if d < best_d:
+                    best_d = d
+                    best_name = name
+            return best_name
+        return None  # 不在目的地附近,不送达
+    # 无坐标时按 hint 文本模糊匹配(兜底)
     hint = errand.get("hint", "")
     for name, coords in place_coords.items():
         if _haversine_km(pos, coords) <= radius_km:
-            return name
+            if hint and (hint in name or name in hint):
+                return name
     return None
 
 

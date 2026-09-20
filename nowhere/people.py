@@ -39,7 +39,7 @@ def _load() -> dict:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
-        pass
+        pass  # intentionally ignored: stdout reconfigure may fail on some terminals
     if not _SEED_FILE.exists():
         print("[people] seed file missing", flush=True)
         _data = {}
@@ -80,7 +80,7 @@ def _load_place_coords() -> dict[str, tuple[float, float]]:
                 if "lat" in entry and "lon" in entry:
                     coords[name] = (entry["lat"], entry["lon"])
         except Exception:
-            pass
+            pass  # intentionally ignored: corrupt or missing humanities.json
 
     # 2) places_patch.json (flat {name: [lat, lon]} or {name: {lat,lon}})
     pp_path = _DATA_DIR / "places_patch.json"
@@ -96,7 +96,7 @@ def _load_place_coords() -> dict[str, tuple[float, float]]:
                         if lat is not None and lon is not None:
                             coords[name] = (lat, lon)
         except Exception:
-            pass
+            pass  # intentionally ignored: corrupt or missing places_patch.json
 
     _place_coords = coords
     return _place_coords

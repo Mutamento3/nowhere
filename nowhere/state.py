@@ -283,7 +283,7 @@ class WorldState:
             try:
                 os.replace(str(_SAVE_FILE), str(backup))
             except OSError:
-                pass
+                pass  # intentionally ignored: backup rename failure, will still reinitialize
             msg = f"存档读不出来,已备份到 {backup.name},旅程重新开始"
             logging.getLogger(__name__).warning("%s (%s)", msg, exc)
             return None

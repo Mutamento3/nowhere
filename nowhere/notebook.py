@@ -194,7 +194,7 @@ def _time_word(dt: datetime | None, lat: float = 30.0, lon: float = 120.0) -> st
         if tz_name:
             dt = dt.astimezone(ZoneInfo(tz_name))
     except Exception:
-        pass
+        pass  # intentionally ignored: timezone lookup failure, falls back to UTC
     h = dt.hour
     if 5 <= h < 8:
         return "清晨"
@@ -432,7 +432,7 @@ def _render_overview() -> str:
                 lat = 30.0  # TODO: pass actual lat from caller; default is ~mid-latitude China
                 first_season = _compute_season(dt.month, lat)
             except Exception:
-                pass
+                pass  # intentionally ignored: datetime parse failure, season left blank
 
         # 最近一笔
         last = main_list[-1] if main_list else None
@@ -480,7 +480,7 @@ def _render_volume(volume: str) -> str:
                 dt = datetime.fromisoformat(at)
                 season = _compute_season(dt.month, 30.0)
             except Exception:
-                pass
+                pass  # intentionally ignored: datetime parse failure, season left blank
 
         # 第一行: "云莓——拉普兰,夏天"
         parts = [name]
@@ -512,7 +512,7 @@ def _render_volume(volume: str) -> str:
                     dt = datetime.fromisoformat(at)
                     season = _compute_season(dt.month, 30.0)
                 except Exception:
-                    pass
+                    pass  # intentionally ignored: datetime parse failure, season left blank
 
             parts = [name]
             if place and season:

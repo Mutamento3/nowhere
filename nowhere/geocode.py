@@ -131,7 +131,7 @@ async def lookup(place: str) -> tuple[float, float] | None:
             _geocode_cache[key] = result
             return result
     except Exception:
-        pass
+        pass  # intentionally ignored: geocoding failure (network/API), caller handles None
 
     _geocode_cache[key] = None
     return None

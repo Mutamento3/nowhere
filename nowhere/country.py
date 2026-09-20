@@ -31,7 +31,7 @@ def _load() -> None:
             try:
                 _cities.append((float(parts[4]), float(parts[5]), parts[8]))
             except ValueError:
-                continue
+                continue  # intentionally ignored: malformed coordinate in city data
 
 
 def country_code_of(lat: float, lon: float) -> str | None:

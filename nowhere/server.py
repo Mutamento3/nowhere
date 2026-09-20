@@ -348,7 +348,7 @@ def _check_meteor_shower(dt: datetime, weather_precip: str, phase: str,
         try:
             peak_dt = _date(local_d.year, int(peak[:2]), int(peak[3:5]))
         except (ValueError, IndexError):
-            continue
+            continue  # intentionally ignored: malformed meteor shower peak date
         diff = abs((local_d - peak_dt).days)
         if diff <= days:
             is_peak = diff == 0
@@ -1189,7 +1189,7 @@ def _compute_wilderness_depth_km(lat: float, lon: float) -> float:
                 if d < min_dist:
                     min_dist = d
     except Exception:
-        pass
+        logger.debug("explorable_index load failed", exc_info=True)
 
     # Check offline water features
     try:
@@ -1201,7 +1201,7 @@ def _compute_wilderness_depth_km(lat: float, lon: float) -> float:
             if d < min_dist:
                 min_dist = d
     except Exception:
-        pass
+        logger.debug("water_features load failed", exc_info=True)
 
     # If no features found, return a large value
     if min_dist == float("inf"):
@@ -1781,7 +1781,7 @@ def _resolve_water_body_label(dest_surface: str, lat: float, lon: float) -> str:
             if ftype == "lake" or fname.endswith("湖"):
                 return "湖边"
     except Exception:
-        pass
+        logger.debug("water body label lookup failed", exc_info=True)
     return "河边"
 
 
@@ -1890,7 +1890,7 @@ async def _gather_env(lat: float, lon: float, dt: datetime) -> dict[str, Any]:
     try:
         elev: float = await asyncio.to_thread(terrain.elevation, lat, lon, _pn)
     except Exception:
-        elev = 0.0
+        elev = 0.0  # intentionally ignored: elevation lookup failure, degrade gracefully
 
     # Get local hour for diurnal temperature variation
     local_hour = None
@@ -2023,7 +2023,7 @@ def _check_festival_chase(lat: float, lon: float,
                                  tzinfo=sim_time.tzinfo or timezone.utc)
             days_until = (fest_date - sim_time).days
         except (ValueError, TypeError):
-            continue
+            continue  # intentionally ignored: malformed festival date in data
 
         if days_until < 0 or days_until > 5:
             continue
@@ -2041,7 +2041,7 @@ def _check_festival_chase(lat: float, lon: float,
                 continue
             fest_lat, fest_lon = coords["lat"], coords["lon"]
         except Exception:
-            continue
+            continue  # intentionally ignored: humanities coord lookup failure, skip festival
 
         # Haversine distance
         dlat = math.radians(fest_lat - lat)
@@ -2096,7 +2096,7 @@ def _get_fest_place_coords(place_name: str) -> tuple[float, float] | None:
         else:
             result = None
     except Exception:
-        result = None
+        result = None  # intentionally ignored: humanities lookup failure, cache None
     _fest_place_coords_cache[place_name] = result
     return result
 
@@ -2138,7 +2138,7 @@ def _festival_in_window(fest: dict, sim_date: _date, lat: float,
             fest_start = _date(sim_date.year, start[0], start[1])
             fest_end = _date(sim_date.year, end[0], end[1])
         except (ValueError, IndexError):
-            return False
+            return False  # intentionally ignored: malformed festival window dates
         # Handle year boundary (e.g. Dec-Jan festivals)
         if fest_start > fest_end:
             if sim_date.month >= fest_start.month:
@@ -2159,7 +2159,7 @@ def _festival_in_window(fest: dict, sim_date: _date, lat: float,
         try:
             fest_start = _date(sim_date.year, md[0], md[1])
         except (ValueError, IndexError):
-            return False
+            return False  # intentionally ignored: malformed festival window dates
         from datetime import timedelta
         fest_end = fest_start + timedelta(days=span - 1)
         return fest_start <= sim_date <= fest_end
@@ -2183,7 +2183,7 @@ def _festival_in_window(fest: dict, sim_date: _date, lat: float,
         try:
             base = _date(sim_date.year, base_date[0], base_date[1])
         except (ValueError, IndexError):
-            return False
+            return False  # intentionally ignored: malformed festival window dates
         from datetime import timedelta
         lat_offset = (lat - base_lat) * days_per_deg
         adjusted_start = base + timedelta(days=int(lat_offset))
@@ -2297,7 +2297,7 @@ def _check_festival_hit(
                     try:
                         fest_start = _date(sim_date.year, start[0], start[1])
                     except (ValueError, IndexError):
-                        pass
+                        pass  # intentionally ignored: malformed festival fixed date
             elif wtype in ("lunar", "hijri", "solar", "islamic"):
                 years = window.get("years", {})
                 md = years.get(str(sim_date.year))
@@ -2305,14 +2305,14 @@ def _check_festival_hit(
                     try:
                         fest_start = _date(sim_date.year, md[0], md[1])
                     except (ValueError, IndexError):
-                        pass
+                        pass  # intentionally ignored: malformed festival lunar date
             elif wtype == "lat_rule":
                 base_date = window.get("base_date")
                 if base_date and len(base_date) >= 2:
                     try:
                         fest_start = _date(sim_date.year, base_date[0], base_date[1])
                     except (ValueError, IndexError):
-                        pass
+                        pass  # intentionally ignored: malformed festival lat_rule date
             if not (fest_start and tomorrow == fest_start):
                 continue
             # Place/country priority
@@ -2418,7 +2418,7 @@ def _check_near_festival(
                 try:
                     start_date = _date(sim_date.year, start[0], start[1])
                 except (ValueError, IndexError):
-                    pass
+                    pass  # intentionally ignored: malformed festival fixed date
 
         elif wtype in ("lunar", "hijri", "solar", "islamic"):
             years = window.get("years", {})
@@ -2428,7 +2428,7 @@ def _check_near_festival(
                 try:
                     start_date = _date(sim_date.year, md[0], md[1])
                 except (ValueError, IndexError):
-                    pass
+                    pass  # intentionally ignored: malformed festival lunar date
 
         elif wtype == "lat_rule":
             # Card 68: geo constraint gate
@@ -2444,7 +2444,7 @@ def _check_near_festival(
             try:
                 base = _date(sim_date.year, base_date[0], base_date[1])
             except (ValueError, IndexError):
-                base = None
+                base = None  # intentionally ignored: malformed festival lat_rule date
             if base is not None:
                 from datetime import timedelta
                 lat_offset = (lat - base_lat) * days_per_deg
@@ -2962,7 +2962,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         if sst is not None:
             sst_text = water.describe_sst(sst, _rng)
     except Exception:
-        pass
+        logger.debug("sea_surface_temp failed", exc_info=True)
 
     # Marine life encounter (30% chance near water)
     marine_text = ""
@@ -2972,7 +2972,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             if m:
                 marine_text = f"{m['common_name']}。{m['distance_m']}米外。{m['scene']}"
         except Exception:
-            pass
+            logger.debug("marine_life failed", exc_info=True)
 
     # ── 4. Salience candidates → rank ────────────────────────────────
     # Card 53: compute heavy_nearby before ranking so gravity can warp scores
@@ -3013,7 +3013,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         if gains and gains > 50:
             hooks.append(("uphill", None))
     except AttributeError:
-        pass
+        pass  # intentionally ignored: walk_mod.best_uphill_gain may not exist yet
 
     # 附近可去的地方——单独传，不跟其他钩子竞争
     nearby_places = _find_nearby_destinations(lat, lon, _rng)
@@ -3603,7 +3603,7 @@ def _load_souvenirs_by_place() -> dict:
         try:
             _SOUVENIRS_BY_PLACE = _json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
         except Exception:
-            _SOUVENIRS_BY_PLACE = {}
+            _SOUVENIRS_BY_PLACE = {}  # intentionally ignored: corrupt souvenirs data file
     return _SOUVENIRS_BY_PLACE
 
 
@@ -3866,7 +3866,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
                     _nb_env["_dt"] = now
                     notebook_mod.record_with_env("water", _wn, _state.place_name or "", _nb_env, lat)
         except Exception:
-            pass
+            logger.debug("water notebook recording failed", exc_info=True)
 
     sst_text = ""
     try:
@@ -3874,7 +3874,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
         if sst is not None:
             sst_text = water.describe_sst(sst, _rng)
     except Exception:
-        pass
+        logger.debug("sea_surface_temp failed", exc_info=True)
 
     marine_text = ""
     if _rng.random() < 0.3:
@@ -3883,7 +3883,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
             if m:
                 marine_text = f"{m['common_name']}。{m['distance_m']}米外。{m['scene']}"
         except Exception:
-            pass
+            logger.debug("marine_life failed", exc_info=True)
 
     # ── Along-river narrative: detect flow alignment ──────────────
     river_text = ""
@@ -4043,7 +4043,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
         try:
             sections.remove(marine_text)
         except ValueError:
-            pass
+            pass  # intentionally ignored: marine_text already removed from sections
 
     # ── Card 52: filter "ask" hints — only if knowledge layer has content ──
     sections = _filter_ask_hints(sections)
@@ -4196,7 +4196,7 @@ async def _try_play_stream(stream_url: str, seconds: int) -> bool:
             if proc.returncode is None:  # still running = success
                 return True
         except Exception:
-            pass
+            logger.debug("ffplay stream failed", exc_info=True)
 
     # Try mpv as fallback
     if shutil.which("mpv"):
@@ -4215,7 +4215,7 @@ async def _try_play_stream(stream_url: str, seconds: int) -> bool:
             if proc.returncode is None:
                 return True
         except Exception:
-            pass
+            logger.debug("mpv stream failed", exc_info=True)
 
     return False
 
@@ -4277,13 +4277,13 @@ async def listen_impl(seconds: int = 10) -> dict:
     try:
         analysis = await asyncio.wait_for(listen_mod.capture(stream_url, seconds), timeout=seconds + 20)
     except (asyncio.TimeoutError, Exception):
-        analysis = None
+        analysis = None  # intentionally ignored: radio capture timeout, proceed without analysis
 
     # ── 2b. Try to actually play the stream ──────────────────────────
     try:
         playing = await asyncio.wait_for(_try_play_stream(stream_url, seconds), timeout=seconds + 20)
     except (asyncio.TimeoutError, Exception):
-        playing = False
+        playing = False  # intentionally ignored: radio play timeout, proceed without playback
 
     # ── 3. Render radio description with analysis data ───────────────
     radio_text = describe.render("radio", station, None, _rng)
@@ -4489,7 +4489,7 @@ async def look_around_impl() -> dict:
                     _nb_env["_dt"] = now
                     notebook_mod.record_with_env("fauna", _fn, place, _nb_env, lat)
             except Exception:
-                pass
+                logger.debug("fauna notebook recording failed", exc_info=True)
 
     # ── 6. Art encounter - 30% chance ───────────────────────────────
     if _rng.random() < 0.3:
@@ -5202,7 +5202,7 @@ def _clamp_coastal_elevation(elev: float, surface: str, lat: float, lon: float) 
                     clon = float(parts[5])
                     pop = int(parts[14] or 0)
                 except ValueError:
-                    continue
+                    continue  # intentionally ignored: malformed city data line
                 if pop < 100_000:
                     continue
                 dlat = clat - lat
@@ -5439,7 +5439,7 @@ def _localized_place_name(place_name: str, lat: float, lon: float) -> str:
             try:
                 clat, clon = float(parts[4]), float(parts[5])
             except ValueError:
-                continue
+                continue  # intentionally ignored: malformed city data line
             dlat = clat - lat
             dlon = clon - lon
             if dlon > 180:
@@ -6336,7 +6336,7 @@ def talk_impl(question: str | None = None) -> dict:
             _nb_env["_dt"] = _state.now()
             notebook_mod.record_with_env("people", person, place, _nb_env, _lat)
         except Exception:
-            pass
+            logger.debug("people notebook recording failed", exc_info=True)
 
     _state.save()
 

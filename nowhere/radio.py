@@ -240,7 +240,7 @@ async def nearest(lat: float, lon: float, country_code: str | None, rng: random.
                             "homepage": st.get("homepage", ""),
                         }
                 except (httpx.HTTPError, httpx.TimeoutException, ValueError):
-                    continue
+                    continue  # intentionally ignored: per-station network failure, try next
 
     # ── Fallback ─────────────────────────────────────────────────────
     return _pick_nearest_from_fallback(lat, lon, country_code=country_code)

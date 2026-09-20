@@ -3016,7 +3016,13 @@ def _render_water_features(payload: dict, prev: dict | None, rng: random.Random)
                         # Fallback to culture or along fields when scene is empty
                         scene_text = seg.get("culture", "") or seg.get("along", "") or ""
                     if scene_text:
-                        return scene_text
+                        # Card 33: apply metadata filter to named water scenes too
+                        if _CURRENT_SEASON:
+                            _filtered = filter_by_card_meta([scene_text], _CURRENT_SEASON, _CURRENT_LAT, biome)
+                            if _filtered:
+                                return _filtered[0]
+                        else:
+                            return scene_text
 
     # Card 33: read biome-specific product file directly
     if biome:

@@ -94,7 +94,7 @@ def _load_index() -> dict:
         try:
             return json.loads(_INDEX_FILE.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            pass  # intentionally ignored: corrupt index file, will reinitialize
     return {"active": None, "journeys": []}
 
 
@@ -287,7 +287,7 @@ def atlas() -> dict:
                         "lon": pos[1],
                     })
             except Exception:
-                continue
+                continue  # intentionally ignored: geocode lookup failure, skip place
 
     if not places:
         return {"places": 0, "continents": 0, "extremes": {}}

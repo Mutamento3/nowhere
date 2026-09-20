@@ -180,7 +180,7 @@ async def capture(stream_url: str, seconds: int = 10) -> dict:
     try:
         return await _capture_ffmpeg(stream_url, seconds)
     except Exception:
-        pass
+        pass  # intentionally ignored: ffmpeg capture failed, falling back to degraded mode
 
     try:
         return await _capture_degraded(stream_url, seconds)

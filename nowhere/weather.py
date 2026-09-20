@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import logging
 import math
 import os
 import random
 from typing import Any, Final
+
+logger = logging.getLogger(__name__)
 
 from nowhere import providers
 
@@ -223,7 +226,7 @@ async def current(lat: float, lon: float, elevation: float | None = None,
             # QWeather already returns current temperature — no diurnal correction needed
             return qw
     except Exception:
-        pass
+        logger.warning("QWeather failed unexpectedly", exc_info=True)
 
     # 1) Try Open-Meteo next (accurate, accounts for elevation)
     try:
@@ -232,7 +235,7 @@ async def current(lat: float, lon: float, elevation: float | None = None,
             # Open-Meteo already returns current temperature — no diurnal correction needed
             return online
     except Exception:
-        pass
+        logger.warning("Open-Meteo failed unexpectedly", exc_info=True)
 
     # 2) Climate zone offline fallback (needs lapse rate correction)
     return _climate_fallback(lat, lon, elevation=elevation, local_hour=local_hour)

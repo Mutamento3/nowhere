@@ -54,7 +54,7 @@ def _load_patch_jitter() -> dict[str, float]:
                     if isinstance(info, dict) and "jitter_deg" in info:
                         _patch_jitter[name] = float(info["jitter_deg"])
             except (json.JSONDecodeError, OSError):
-                pass
+                pass  # intentionally ignored: corrupt or missing jitter patch file
     return _patch_jitter
 
 

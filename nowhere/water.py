@@ -67,7 +67,7 @@ async def sea_surface_temp(lat: float, lon: float) -> float | None:
             try:
                 return float(cur["sea_surface_temperature"])
             except (ValueError, TypeError):
-                pass
+                pass  # intentionally ignored: malformed SST value in API response
 
     # ── Offline fallback: climate zone table ────────────────────────
     zone = _climate_zone(lat)
@@ -255,7 +255,7 @@ async def marine_life(lat: float, lon: float, rng: random.Random, *, biome: str 
                 scene = rng.choice(_MARINE_SCENES.get(scene_key, _MARINE_SCENES["fish"]))
                 return {"common_name": common_name, "distance_m": dist, "scene": scene}
     except Exception:
-        pass
+        pass  # intentionally ignored: marine life network failure, falling back to offline
 
     # Offline fallback
     return _offline_marine(lat, rng)
