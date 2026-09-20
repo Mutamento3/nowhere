@@ -183,7 +183,7 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
     place_name = ""
 
     if rng is None:
-        rng = random.Random(hash((lat, lon, topic)))
+        rng = _random.Random(hash((lat, lon, topic)))
     kb = _load_local_kb()
 
     # ── 1. Exact match ──
