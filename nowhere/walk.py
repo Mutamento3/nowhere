@@ -137,7 +137,8 @@ def step(
 
     max_dist: override the maximum distance per step (Card 50: fatigue cap).
     """
-    assert state.pos is not None, "state.pos must be set before stepping"
+    if state.pos is None:
+        raise RuntimeError("state.pos must be set before stepping")
     orig_dist = dist_km
     dist_km = max(_DIST_MIN, min(max_dist, dist_km))
     clamped = dist_km != orig_dist
