@@ -17,9 +17,12 @@ import tempfile
 from pathlib import Path
 
 
+from nowhere.util import _get_home
+
+
 def _path(name: str) -> Path:
-    base = os.environ.get("NOWHERE_HOME") or str(Path.home() / ".nowhere")
-    return Path(base) / name
+    # A8: home resolution is shared with notebook / state (nowhere.util).
+    return _get_home() / name
 
 
 def _load(name: str) -> dict:
@@ -29,6 +32,17 @@ def _load(name: str) -> dict:
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
+        # ERR-05: a corrupt file must be preserved — the next save would
+        # otherwise overwrite it with {} and silently destroy the data.
+        backup = p.with_name(p.name + ".corrupt")
+        n = 0
+        while backup.exists():
+            n += 1
+            backup = p.with_name(f"{p.name}.corrupt.{n}")
+        try:
+            p.replace(backup)
+        except OSError:
+            pass  # intentionally ignored: backup failure, still return empty
         return {}
 
 

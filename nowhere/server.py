@@ -189,6 +189,19 @@ def _load_meteor_showers() -> dict:
     return getattr(_load_meteor_showers, cache_key)
 
 
+def _load_phenology() -> dict:
+    """Load phenology.json once and cache."""
+    cache_key = "_phenology_cache"
+    if not hasattr(_load_phenology, cache_key):
+        fp = _TIMEAXES_DATA_DIR / "phenology.json"
+        if fp.exists():
+            setattr(_load_phenology, cache_key,
+                    _json.loads(fp.read_text(encoding="utf-8")))
+        else:
+            setattr(_load_phenology, cache_key, {})
+    return getattr(_load_phenology, cache_key)
+
+
 def _load_mishaps() -> list[dict]:
     """Load mishaps.json once and cache."""
     cache_key = "_mishaps_cache"
@@ -1904,7 +1917,7 @@ async def _gather_env(lat: float, lon: float, dt: datetime) -> dict[str, Any]:
         asyncio.to_thread(terrain.surface, lat, lon),
         asyncio.to_thread(sky.sun_moon, lat, lon, dt),
         asyncio.to_thread(sky.visible_sky, lat, lon, dt, _rng),
-        asyncio.wait_for(weather.current(lat, lon, elevation=elev, local_hour=local_hour), timeout=10.0),
+        asyncio.wait_for(weather.current(lat, lon, elevation=elev, local_hour=local_hour, dt=dt), timeout=10.0),
         _get_radio(lat, lon),
         asyncio.wait_for(hydrology.nearby_water(lat, lon), timeout=5.0),
     ]
@@ -2368,6 +2381,16 @@ def _check_festival_hit(
     return card
 
 
+def _announce_festival_name(fest_name: str, rng: random.Random) -> str:
+    """Generate a festival name announcement prefix (3 variants)."""
+    _ANNOUNCE_VARIANTS = [
+        f"今天是{fest_name}。",
+        f"{fest_name}。",
+        f"你到的这天,正是{fest_name}。",
+    ]
+    return rng.choice(_ANNOUNCE_VARIANTS)
+
+
 def _announce_festival_crossing(fest_name: str, rng: random.Random) -> str:
     """Generate a festival crossing announcement (3 variants).
 
@@ -2712,6 +2735,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             "kind": "farewell",
             "text": farewell_text,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "sim_time": (_state.now().isoformat() if _state.now() else None),
         })
 
         # Save current journey (with farewell in log)
@@ -2909,7 +2933,10 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             elevation=env.get("elevation"), surface=env.get("surface"),
         )
 
-    # biome 缺失时按地表推(定向开门没有 pool 标签)
+    # biome 缺失时: 先取 pool.json 手核 biome(定向开门没有 landing 标签),
+    # 再按地表推。A10: pool 的 biome 是全库唯一带手核权威的来源。
+    if _state.biome is None:
+        _state.biome = terrain.pool_biome(lat, lon, place_name)
     if _state.biome is None:
         _SURFACE_BIOME = {
             "urban": "city", "water_ocean": "coast", "water_fresh": "coast",
@@ -2928,7 +2955,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         if online_wf:
             water_features = online_wf
     except Exception:
-        pass  # offline result already populated
+        pass  # intentionally ignored: Overpass fallback
 
     # Card 71 B1: filter water features by biome — inland city ≠ ocean
     if water_features and (_state.biome or "") == "city":
@@ -2958,7 +2985,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     # Sea surface temperature
     sst_text = ""
     try:
-        sst = await asyncio.wait_for(water.sea_surface_temp(lat, lon), timeout=8.0)
+        sst = await asyncio.wait_for(water.sea_surface_temp(lat, lon, dt=_state.now()), timeout=8.0)
         if sst is not None:
             sst_text = water.describe_sst(sst, _rng)
     except Exception:
@@ -3544,6 +3571,21 @@ def _check_fatigue_slope_block(slope_deg: float) -> str | None:
     return None
 
 
+def _check_late_night_shop(env: dict) -> bool:
+    """Check if it's late night in city (0-5am). Card 50: time resistance."""
+    if _state.biome != "city":
+        return False
+    now = _state.now()
+    if now is None:
+        return False
+    from zoneinfo import ZoneInfo
+    tz_name = _tf.timezone_at(lat=_state.pos[0], lng=_state.pos[1]) if _state.pos else None
+    if not tz_name:
+        return False
+    local_hour = now.astimezone(ZoneInfo(tz_name)).hour
+    return 0 <= local_hour < 5
+
+
 def _body_text_for_food_clear(rng: random.Random) -> str:
     """Text when eating clears hunger. Card 50: food satisfaction."""
     _state.hunger = 0.0
@@ -3716,11 +3758,15 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     _max_dist = walk_mod._DIST_MAX_FATIGUED if _state.fatigue > 6.0 else walk_mod._DIST_MAX
     # Card 50: fatigue+slope block — check BEFORE step (step modifies state)
     if bearing is not None and _state.pos:
-        _dest_lat, _dest_lon = terrain.destination(_state.pos[0], _state.pos[1], bearing, distance_km)
-        _pre_slope, _ = terrain.slope_between(_state.pos, (_dest_lat, _dest_lon))
-        _fatigue_block = _check_fatigue_slope_block(_pre_slope)
-        if _fatigue_block:
-            return {"text": _fatigue_block, "data": {"error": "fatigue_slope_block", "slope_deg": _pre_slope, "fatigue": _state.fatigue}}
+        try:
+            _dest = terrain.destination(_state.pos[0], _state.pos[1], bearing, distance_km)
+            if isinstance(_dest, (tuple, list)) and len(_dest) == 2:
+                _pre_slope, _ = terrain.slope_between(_state.pos, _dest)
+                _fatigue_block = _check_fatigue_slope_block(_pre_slope)
+                if _fatigue_block:
+                    return {"text": _fatigue_block, "data": {"error": "fatigue_slope_block", "slope_deg": _pre_slope, "fatigue": _state.fatigue}}
+        except Exception:
+            pass  # intentionally ignored: pre-check is best-effort, step() has its own guards
     # Card 64: snapshot timezone before step for jump detection
     _tz_before = _tf.timezone_at(lat=_state.pos[0], lng=_state.pos[1]) if _state.pos else None
     step_result = walk_mod.step(_state, bearing, semantic, distance_km, max_dist=_max_dist)
@@ -3819,13 +3865,13 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     else:
         env, env_cached = await _gather_env_cached(lat, lon, now)
 
-    # Attach step data to terrain payload
-    env["terrain"] = {
+    # Attach step data to terrain payload (copy: don't pollute cached last_env)
+    env = {**env, "terrain": {
         "surface": step_result.get("new_surface", env.get("surface")),
         "elevation": env.get("elevation", 0),
         "slope_deg": step_result.get("slope_deg", 0),
         "elevation_delta": step_result.get("elevation_delta", 0),
-    }
+    }}
 
     # ── 3b. Walk discovery + narrative continuity ─────────────────────
     current_surface = step_result.get("new_surface", env.get("surface", ""))
@@ -3846,7 +3892,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
         if online_wf:
             water_features = online_wf
     except Exception:
-        pass  # offline result already populated
+        pass  # intentionally ignored: Overpass fallback
 
     # Build water feature description from offline data
     if water_features:
@@ -3870,7 +3916,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
 
     sst_text = ""
     try:
-        sst = await asyncio.wait_for(water.sea_surface_temp(lat, lon), timeout=8.0)
+        sst = await asyncio.wait_for(water.sea_surface_temp(lat, lon, dt=_state.now()), timeout=8.0)
         if sst is not None:
             sst_text = water.describe_sst(sst, _rng)
     except Exception:
@@ -4230,8 +4276,10 @@ async def listen_impl(seconds: int = 10) -> dict:
 
     if seconds <= 0:
         return {"text": "听多久？给个数。", "data": {"error": "bad_seconds"}}
+    clamped = False
     if seconds > 60:
         seconds = 60
+        clamped = True
 
     lat, lon = _state.pos
 
@@ -4270,7 +4318,7 @@ async def listen_impl(seconds: int = 10) -> dict:
         _state.last_text = full_text
         _record_footprint("listen", full_text)
         _state.save()
-        return {"text": full_text, "data": {"stream_url": None, "soundscape": sound_text}}
+        return {"text": full_text, "data": {"stream_url": None, "soundscape": sound_text, "clamped": clamped}}
 
     # ── 2. Capture & analyse ─────────────────────────────────────────
     stream_url = station["stream_url"]
@@ -4362,6 +4410,7 @@ async def listen_impl(seconds: int = 10) -> dict:
             "analysis": analysis,
             "soundscape": sound_text,
             "playing": playing,
+            "clamped": clamped,
         },
     }
 
@@ -4471,7 +4520,8 @@ async def look_around_impl() -> dict:
         life_result = await asyncio.wait_for(life.nearby(lat, lon, night=night, weather_text=weather_text,
                                         radius_km=radius, biome=_state.biome, rng=_rng,
                                         month=current_month), timeout=10.0)
-        if life_result and (life_result.get("distance_m") or 999) < 3000:
+        d = life_result.get("distance_m") if life_result else None
+        if life_result and d is not None and d < 3000:
             placememory.record_sighting(
                 name=life_result.get("name", ""),
                 common_name=life_result.get("common_name", ""),
@@ -6050,6 +6100,7 @@ def deliver_impl() -> dict:
             "kind": "delivery",
             "text": journal_entry,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "sim_time": now.isoformat(),
         })
         _record_footprint("deliver", journal_entry)
         _state.save()
@@ -6248,8 +6299,10 @@ def say_impl(text: str) -> dict:
     text = text.strip()
     if not text:
         return {"text": "你没说话。", "data": {"error": "empty"}}
+    truncated = False
     if len(text) > 500:
         text = text[:500]
+        truncated = True
 
     now = _state.now()
     sim_time = now.isoformat() if now else None
@@ -6269,7 +6322,10 @@ def say_impl(text: str) -> dict:
 
     _ACK_VARIANTS = ["记下了。", "这句话留在这了。", "嗯。世界听到了。", "你说了。风把它带走了。"]
     ack = _rng.choice(_ACK_VARIANTS)
-    return {"text": ack, "data": {"saved": True}}
+    data: dict = {"saved": True}
+    if truncated:
+        data["truncated"] = True
+    return {"text": ack, "data": data}
 
 
 @mcp.tool()
@@ -6363,7 +6419,7 @@ def journal() -> dict:
         return {"text": "旅程日志是空的。", "data": {"entries": []}}
     try:
         lines = log_path.read_text(encoding="utf-8").strip().split("\n")
-        entries = [json.loads(line) for line in lines if line.strip()]
+        entries = [_json.loads(line) for line in lines if line.strip()]
     except Exception:
         return {"text": "日志读不出来。", "data": {"entries": []}}
     if not entries:
@@ -6597,7 +6653,7 @@ def _log_journey_event(kind: str, summary: str) -> None:
         "summary": summary,
     }
     with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 # =====================================================================

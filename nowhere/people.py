@@ -52,11 +52,8 @@ def _load() -> dict:
     return _data
 
 
-from nowhere.terrain import haversine_km as _haversine_km_raw
-
-def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
-    """Haversine distance in km (tuple wrapper around terrain.haversine_km)."""
-    return _haversine_km_raw(a[0], a[1], b[0], b[1])
+# A8: tuple-pair wrapper has one home — errands — over terrain.haversine_km.
+from nowhere.errands import _haversine_km
 
 
 # ── Place coords (seeded from people_seed places, keyed by place name) ──
@@ -83,7 +80,7 @@ def _load_place_coords() -> dict[str, tuple[float, float]]:
                 if "lat" in entry and "lon" in entry:
                     coords[name] = (entry["lat"], entry["lon"])
         except Exception:
-            pass  # intentionally ignored: corrupt or missing humanities.json
+            pass  # intentionally ignored: coord data optional
 
     # 2) places_patch.json (flat {name: [lat, lon]} or {name: {lat,lon}})
     pp_path = _DATA_DIR / "places_patch.json"
@@ -99,7 +96,7 @@ def _load_place_coords() -> dict[str, tuple[float, float]]:
                         if lat is not None and lon is not None:
                             coords[name] = (lat, lon)
         except Exception:
-            pass  # intentionally ignored: corrupt or missing places_patch.json
+            pass  # intentionally ignored: coord data optional
 
     _place_coords = coords
     return _place_coords

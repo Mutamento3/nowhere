@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import tempfile
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-_SAVE_DIR = pathlib.Path(os.environ.get("NOWHERE_HOME") or str(pathlib.Path.home() / ".nowhere"))
+from nowhere.util import _get_home
+
+# A8: home resolution is shared with notebook / placememory (nowhere.util).
+_SAVE_DIR = _get_home()
 _SAVE_FILE = _SAVE_DIR / "journey.json"
 
 

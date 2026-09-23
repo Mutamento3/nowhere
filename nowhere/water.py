@@ -45,10 +45,12 @@ def _stable_random(lat: float, lon: float, low: float, high: float) -> float:
     return random.Random(seed).uniform(low, high)
 
 
-async def sea_surface_temp(lat: float, lon: float) -> float | None:
+async def sea_surface_temp(lat: float, lon: float, dt: datetime.datetime | None = None) -> float | None:
     """Return sea surface temperature in Celsius, or None for land.
 
     Fallback chain: Open-Meteo marine -> climate zone offline table.
+    ``dt`` — simulated clock time; its month drives the offline table so the
+    world's season does not leak the real one.
     """
     # ── Land check ──────────────────────────────────────────────────
     if not terrain.is_water(lat, lon):
@@ -71,7 +73,8 @@ async def sea_surface_temp(lat: float, lon: float) -> float | None:
 
     # ── Offline fallback: climate zone table ────────────────────────
     zone = _climate_zone(lat)
-    month = datetime.date.today().month - 1  # 0-indexed
+    ref = dt if dt is not None else datetime.date.today()
+    month = ref.month - 1  # 0-indexed
     # Southern hemisphere: shift month by 6 to flip seasons
     if lat < 0:
         month = (month + 6) % 12
@@ -195,7 +198,7 @@ def _offline_marine(lat: float, rng: random.Random) -> dict:
     name, scenes = rng.choice(pool)
     scene = rng.choice(scenes)
     dist = rng.randint(50, 2000)
-    return {"common_name": name, "distance_m": dist, "scene": scene}
+    return {"common_name": name, "distance_m": dist, "scene": scene, "source": "offline"}
 
 
 _MARINE_BIOMES = frozenset({"coast", "ocean", "island"})
@@ -253,7 +256,7 @@ async def marine_life(lat: float, lon: float, rng: random.Random, *, biome: str 
                         scene_key = key
                         break
                 scene = rng.choice(_MARINE_SCENES.get(scene_key, _MARINE_SCENES["fish"]))
-                return {"common_name": common_name, "distance_m": dist, "scene": scene}
+                return {"common_name": common_name, "distance_m": dist, "scene": scene, "source": "inat"}
     except Exception:
         pass  # intentionally ignored: marine life network failure, falling back to offline
 

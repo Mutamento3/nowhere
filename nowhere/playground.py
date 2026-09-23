@@ -45,12 +45,7 @@ async def main():
     start_web = "--web" in sys.argv
 
     # 导入内部函数（和 server.py 一样的 _impl 链路）
-    from nowhere import (
-        server, state as state_mod, providers
-    )
-
-    _state = state_mod.WorldState
-    s = server._state  # 共享状态
+    from nowhere import server
 
     print()
     print("=" * 50)

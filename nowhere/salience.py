@@ -53,7 +53,7 @@ def _get_climate_zone_for_situation(lat: float, elev: float = 0) -> str:
     for lo, hi, zone in _CLIMATE_ZONES:
         if lo <= abs_lat < hi:
             return zone
-    return "热带" if abs_lat < 23.5 else "寒带"
+    return "寒带"
 
 
 def _get_culture_region(lat: float, lon: float) -> str:
@@ -124,7 +124,7 @@ class Situation:
             return True
         # water_features arrives as list[dict]; extract first element for filtering
         if isinstance(payload, list):
-            payload = payload[0] if payload else {}
+            payload = payload[0]
         if not isinstance(payload, dict):
             return True
 

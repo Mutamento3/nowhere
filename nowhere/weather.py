@@ -6,19 +6,18 @@ Never returns None, never raises.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import logging
 import math
 import os
-import random
 from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
 from nowhere import providers
 
-# ── QWeather key ───────────────────────────────────────────────────
-_QWEATHER_KEY: str = os.environ.get("NOWHERE_QWEATHER_KEY", "")
+# A8: single source in water — climate-zone / stable-pseudo-random are shared
+# by the air-temperature and sea-surface fallbacks, so only water.py defines them.
+from nowhere.water import _climate_zone, _stable_random
 
 # ── WMO weather code -> (precip, chinese_text) ─────────────────────
 # https://www.noaa.gov/weather/wmo-weather-interpretation-codes
@@ -64,35 +63,36 @@ _CLIMATE_TEMP: Final[dict[str, list[float]]] = {
 }
 
 
-def _climate_zone(lat: float) -> str:
-    """Map latitude to a climate zone name."""
-    abs_lat = abs(lat)
-    if abs_lat < 10:
-        return "equator"
-    if abs_lat < 30:
-        return "subtropical"
-    if abs_lat < 55:
-        return "temperate"
-    if abs_lat < 70:
-        return "subarctic"
-    return "polar"
+def _cloud_from_text(text: str, precip: str) -> float:
+    """Estimate cloud cover percent (0-100) from description / precipitation.
 
-
-def _stable_random(lat: float, lon: float, low: float, high: float) -> float:
-    """Return a deterministic pseudo-random float seeded by lat/lon."""
-    seed_str = f"{lat:.2f},{lon:.2f}"
-    seed = int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2**32)
-    return random.Random(seed).uniform(low, high)
+    CODE-02: consumers (notebook "阴天" branch) read a ``cloud`` key, so every
+    weather payload must carry one even when the upstream API omits it.
+    """
+    if precip in ("rain", "snow", "storm"):
+        return 90.0
+    # Order matters: "大部晴" contains "晴".
+    for kw, cover in (("阴", 95.0), ("雾", 90.0), ("冻雾", 90.0),
+                      ("多云", 55.0), ("大部晴", 30.0), ("晴", 10.0)):
+        if kw in text:
+            return cover
+    return 50.0
 
 
 def _climate_fallback(lat: float, lon: float, elevation: float | None = None,
-                      local_hour: int | None = None) -> dict[str, Any]:
-    """Offline climate-zone estimate. Always returns a valid dict."""
+                      local_hour: int | None = None,
+                      dt: datetime.date | datetime.datetime | None = None) -> dict[str, Any]:
+    """Offline climate-zone estimate. Always returns a valid dict.
+
+    *dt* is the event-time date (same clock as *local_hour*).  TME-01: never
+    fall back to the server's ``date.today()`` when the caller has event time —
+    the two clocks disagree and the diurnal/seasonal maths then mix semantics.
+    """
     zone = _climate_zone(lat)
-    # Use local_hour to infer approximate month if available, else server time
-    # (local_hour alone can't determine month, so we still need today's date,
-    #  but at least we use the correct day boundary for the target timezone)
-    month = datetime.date.today().month  # 1-indexed
+    # Month comes from *dt* (event time) whenever the caller has one.  The
+    # fallback is the *server's* local date — there is no target-timezone
+    # day-boundary math here (local_hour alone cannot determine the month).
+    month = (dt or datetime.date.today()).month  # 1-indexed
     # Southern hemisphere: shift month by 6 to flip seasons
     if lat < 0:
         month = ((month - 1 + 6) % 12) + 1
@@ -108,13 +108,15 @@ def _climate_fallback(lat: float, lon: float, elevation: float | None = None,
     if elevation and elevation > 0:
         temp -= elevation * 0.0065
     wind = _stable_random(lat, lon, 3.0, 8.0)
+    text = "气候估算"
     return {
         "temp_c": round(temp, 1),
         "feels_c": round(temp - 2, 1),
         "wind_ms": round(wind, 1),
         "humidity": 60.0,
         "precip": "none",
-        "text": "气候估算",
+        "cloud": _cloud_from_text(text, "none"),
+        "text": text,
         "source": "climate",
     }
 
@@ -135,8 +137,10 @@ async def _try_qweather(lat: float, lon: float) -> dict[str, Any] | None:
     key = os.environ.get("NOWHERE_QWEATHER_KEY", "")
     if not key:
         return None
-    url = f"https://devapi.qweather.com/v7/weather/now?location={lon},{lat}&key={key}"
-    data = await providers.fetch_json(url, source="qweather", cache_ttl=300)
+    # LOG-04: keep the key out of the URL string — pass it via params so a
+    # provider exception log can never echo the full request URL with credentials.
+    url = f"https://devapi.qweather.com/v7/weather/now?location={lon},{lat}"
+    data = await providers.fetch_json(url, source="qweather", cache_ttl=300, params={"key": key})
     if data is None:
         return None
     if str(data.get("code")) != "200":
@@ -152,12 +156,19 @@ async def _try_qweather(lat: float, lon: float) -> dict[str, Any] | None:
         text = now.get("text", "")
     except (KeyError, ValueError, TypeError):
         return None
+    precip = _precip_from_text(text)
+    # CODE-02: always publish a cloud cover value (0-100).
+    try:
+        cloud = float(now["cloud"]) if now.get("cloud") not in (None, "") else _cloud_from_text(text, precip)
+    except (KeyError, ValueError, TypeError):
+        cloud = _cloud_from_text(text, precip)
     return {
         "temp_c": temp,
         "feels_c": feels,
         "wind_ms": wind,
         "humidity": humidity,
-        "precip": _precip_from_text(text),
+        "precip": precip,
+        "cloud": cloud,
         "text": text,
         "source": "qweather",
     }
@@ -172,7 +183,7 @@ async def _try_openmeteo(lat: float, lon: float) -> dict[str, Any] | None:
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
         f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-        f"precipitation,weather_code,wind_speed_10m"
+        f"precipitation,weather_code,wind_speed_10m,cloud_cover"
     )
     data = await providers.fetch_json(url, source="openmeteo", cache_ttl=300)
     if data is None:
@@ -195,12 +206,18 @@ async def _try_openmeteo(lat: float, lon: float) -> dict[str, Any] | None:
     if precip_type == "none" and precip_val > 0:
         precip_type = "rain"
         text = "降水"
+    # CODE-02: always publish a cloud cover value (0-100).
+    try:
+        cloud = float(cur["cloud_cover"]) if cur.get("cloud_cover") is not None else _cloud_from_text(text, precip_type)
+    except (KeyError, ValueError, TypeError):
+        cloud = _cloud_from_text(text, precip_type)
     return {
         "temp_c": temp,
         "feels_c": feels,
         "wind_ms": wind,
         "humidity": humidity,
         "precip": precip_type,
+        "cloud": cloud,
         "text": text,
         "source": "openmeteo",
     }
@@ -210,12 +227,15 @@ async def _try_openmeteo(lat: float, lon: float) -> dict[str, Any] | None:
 
 
 async def current(lat: float, lon: float, elevation: float | None = None,
-                  local_hour: int | None = None) -> dict[str, Any]:
+                  local_hour: int | None = None,
+                  dt: datetime.date | datetime.datetime | None = None) -> dict[str, Any]:
     """Return weather at (lat, lon).  Never None, never raises.
 
     Fallback chain: qweather (CN only) -> Open-Meteo (accurate) -> climate zone offline (fast).
     Open-Meteo already accounts for elevation, so lapse rate correction
     is only applied to the climate fallback.
+
+    *dt* — event-time date, the same clock behind *local_hour* (TME-01).
     """
     # 0) Try QWeather first (only fires when NOWHERE_QWEATHER_KEY is set).
     #    It returns None fast when the key is missing, so non-CN callers pay
@@ -238,4 +258,4 @@ async def current(lat: float, lon: float, elevation: float | None = None,
         logger.warning("Open-Meteo failed unexpectedly", exc_info=True)
 
     # 2) Climate zone offline fallback (needs lapse rate correction)
-    return _climate_fallback(lat, lon, elevation=elevation, local_hour=local_hour)
+    return _climate_fallback(lat, lon, elevation=elevation, local_hour=local_hour, dt=dt)

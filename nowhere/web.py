@@ -185,11 +185,15 @@ async def post_message(request: Request) -> JSONResponse:
     content = _strip_control_chars(content)
     if _check_injection(content):
         return _bad_request("rejected")
+    truncated = len(content) > _MSG_MAX_LEN
     content = content[:_MSG_MAX_LEN]
     state = _state()
     state.messages.append({"content": content, "encountered": False})
     state.save()
-    return JSONResponse({"ok": True, "queued": len(state.messages)})
+    payload: dict = {"ok": True, "queued": len(state.messages)}
+    if truncated:
+        payload["truncated"] = True
+    return JSONResponse(payload)
 
 
 async def get_messages(_request: Request) -> JSONResponse:
@@ -218,8 +222,11 @@ async def reply_postcard(request: Request) -> JSONResponse:
     content = _strip_control_chars(content)
     if _check_injection(content):
         return _bad_request("rejected")
+    truncated = len(content) > _REPLY_MAX_LEN
     content = content[:_REPLY_MAX_LEN]
     result = reply_postcard_impl(card_id, content)
+    if truncated:
+        result = {**result, "truncated": True}
     return JSONResponse(result, status_code=200 if result["ok"] else 404)
 
 
@@ -247,7 +254,7 @@ async def _body(request: Request) -> dict | JSONResponse:
         return {}
     try:
         body = await request.json()
-    except Exception:
+    except (ValueError, KeyError):
         return _bad_request("invalid_json")
     if not isinstance(body, dict):
         return _bad_request("object_required")

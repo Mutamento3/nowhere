@@ -10,19 +10,32 @@ first_impression: 初见印象,由渲染层用当场上下文从变体池生成,
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
+
+def _stable_seed(*parts: object) -> int:
+    """Deterministic RNG seed (BND-07: builtin hash() is per-process random)."""
+    raw = "|".join(str(p) for p in parts)
+    return int(hashlib.md5(raw.encode("utf-8")).hexdigest(), 16)
+
 
 # ── 文件路径 ─────────────────────────────────────────────────────────
 
+from nowhere.util import _get_home
+
+
 def _notebook_path() -> Path:
-    base = os.environ.get("NOWHERE_HOME") or str(Path.home() / ".nowhere")
-    return Path(base) / "notebook.json"
+    # A8: home resolution is shared with placememory / state (nowhere.util).
+    return _get_home() / "notebook.json"
 
 
 # ── 原子读写 ─────────────────────────────────────────────────────────
@@ -34,6 +47,17 @@ def _load_notebook() -> dict:
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
+        # ERR-05: a corrupt file must be preserved — the next save would
+        # otherwise overwrite it with {} and silently destroy the data.
+        backup = p.with_name(p.name + ".corrupt")
+        n = 0
+        while backup.exists():
+            n += 1
+            backup = p.with_name(f"{p.name}.corrupt.{n}")
+        try:
+            p.replace(backup)
+        except OSError:
+            pass  # intentionally ignored: backup failure, still return empty
         return {}
 
 
@@ -166,18 +190,18 @@ def _weather_word(weather: dict | None) -> str:
         return "雪里"
     if precip == "storm":
         return "暴雨里"
-    wind = weather.get("wind_ms", 0)
-    if wind > 8:
+    wind = weather.get("wind_ms")
+    if wind is not None and wind > 8:
         return "大风里"
-    if wind > 4:
+    if wind is not None and wind > 4:
         return "风里"
-    temp = weather.get("temp_c", 20)
-    if temp > 33:
+    temp = weather.get("temp_c")
+    if temp is not None and temp > 33:
         return "热浪里"
-    if temp < 0:
+    if temp is not None and temp < 0:
         return "冷风里"
-    cloud = weather.get("cloud", 0)
-    if cloud > 70:
+    cloud = weather.get("cloud")
+    if cloud is not None and cloud > 70:
         return "阴天"
     return "晴天"
 
@@ -218,13 +242,13 @@ def _action_word(weather: dict | None, time_word: str) -> str:
         return "躲雨"
     if precip == "snow":
         return "踩雪"
-    wind = weather.get("wind_ms", 0)
-    if wind > 8:
+    wind = weather.get("wind_ms")
+    if wind is not None and wind > 8:
         return "顶风走"
-    temp = weather.get("temp_c", 20)
-    if temp > 33:
+    temp = weather.get("temp_c")
+    if temp is not None and temp > 33:
         return "擦汗"
-    if temp < 0:
+    if temp is not None and temp < 0:
         return "搓手"
     if time_word == "夜里":
         return "摸黑走"
@@ -260,7 +284,7 @@ def _generate_first_impression(
         return None
 
     import random
-    rng = random.Random(hash((volume, name, datetime.now(timezone.utc).isoformat()[:13])))
+    rng = random.Random(_stable_seed(volume, name, datetime.now(timezone.utc).isoformat()[:13]))
 
     weather = (env or {}).get("weather") if env else None
     dt = (env or {}).get("_dt")
@@ -285,6 +309,7 @@ def record(
     name: str,
     place: str,
     first_impression: str | None = None,
+    sim_time: datetime | None = None,
 ) -> None:
     """记一笔到指定册。FIFO 上限 200,"只有一次的"永不丢。"""
     if volume not in VOLUMES:
@@ -297,6 +322,7 @@ def record(
         "name": name,
         "place": place or "",
         "at": now_iso,
+        "sim_time": sim_time.isoformat() if sim_time is not None else None,
         "first_impression": first_impression,
     }
 
@@ -342,7 +368,8 @@ def record_with_env(
 ) -> None:
     """记录一笔,自动生成 first_impression。"""
     fi = _generate_first_impression(volume, name, env, lat, lon)
-    record(volume, name, place, fi)
+    _dt = (env or {}).get("_dt") if env else None
+    record(volume, name, place, fi, sim_time=_dt if isinstance(_dt, datetime) else None)
 
 
 # ── 查询函数 ─────────────────────────────────────────────────────────
@@ -387,6 +414,7 @@ def _time_ago(iso_str: str) -> str:
             return f"{days // 30}个月前"
         return f"{days // 365}年前"
     except Exception:
+        logger.warning("time_ago parse failed for %r", iso_str, exc_info=True)
         return "不久前"
 
 
@@ -416,7 +444,7 @@ def _render_overview() -> str:
         if total == 0:
             empty_variants = _EMPTY_VARIANTS.get(v, ["空的。"])
             import random
-            rng = random.Random(hash(v))
+            rng = random.Random(_stable_seed(v))
             parts.append(rng.choice(empty_variants))
             continue
 
@@ -462,7 +490,7 @@ def _render_volume(volume: str) -> str:
     if not main_list and not unique_list:
         empty_variants = _EMPTY_VARIANTS.get(volume, ["空的。"])
         import random
-        rng = random.Random(hash(volume))
+        rng = random.Random(_stable_seed(volume))
         return rng.choice(empty_variants)
 
     lines: list[str] = []

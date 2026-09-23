@@ -33,6 +33,8 @@ def _make_observer(lat: float, lon: float, dt: datetime) -> ephem.Observer:
     obs.lat = str(lat)
     obs.lon = str(lon)
     # ephem expects UTC as "YYYY/MM/DD HH:MM:SS"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     utc = dt.astimezone(timezone.utc)
     obs.date = utc.strftime("%Y/%m/%d %H:%M:%S")
     return obs
@@ -101,8 +103,7 @@ def sun_moon(lat: float, lon: float, dt: datetime) -> dict:
 def visible_sky(lat: float, lon: float, dt: datetime, rng: _random.Random | None = None) -> dict:
     """Return visible-sky info at *lat*, *lon* for tz-aware *dt* (UTC).
 
-    Keys: planets, moon_phase, moon_alt, milky_way_core_up,
-    constellation_zenith, aurora (dict | None).
+    Keys: planets, moon_phase, moon_alt, milky_way_core_up, aurora (dict | None).
     """
     obs = _make_observer(lat, lon, dt)
 
@@ -127,17 +128,6 @@ def visible_sky(lat: float, lon: float, dt: datetime, rng: _random.Random | None
     sgra._dec = _MILKY_WAY_CORE_DEC
     sgra.compute(obs)
     milky_way_core_up = float(sgra.alt) * 180.0 / math.pi > _MILKY_WAY_ALT_THRESHOLD
-
-    # ── zenith constellation ────────────────────────────────────────
-    zenith = ephem.FixedBody()
-    zenith._ra = obs.sidereal_time()
-    zenith._dec = obs.lat
-    zenith.compute(obs)
-    try:
-        con = ephem.constellation(zenith)
-        constellation_zenith = con[1]  # full name, e.g. "Ophiuchus"
-    except Exception:
-        constellation_zenith = None
 
     # ── aurora (polar night sky phenomenon) ──────────────────────────
     aurora_info: dict | None = None
@@ -189,6 +179,5 @@ def visible_sky(lat: float, lon: float, dt: datetime, rng: _random.Random | None
         "moon_phase": moon_phase,
         "moon_alt": moon_alt,
         "milky_way_core_up": milky_way_core_up,
-        "constellation_zenith": constellation_zenith,
         "aurora": aurora_info,
     }

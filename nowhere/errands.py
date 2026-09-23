@@ -113,8 +113,14 @@ def check_delivery(pos: tuple[float, float], errand: dict,
     hint = errand.get("hint", "")
     for name, coords in place_coords.items():
         if _haversine_km(pos, coords) <= radius_km:
-            if hint and (hint in name or name in hint):
+            if not hint:
+                return name  # 无 hint 时就近即可
+            if hint in name or name in hint:
                 return name
+            # 部分匹配: hint 中任意 2+ 字符子串出现在 name 中
+            for i in range(len(hint) - 1):
+                if hint[i:i+2] in name:
+                    return name
     return None
 
 
@@ -126,10 +132,13 @@ def build_delivery_journal(errand: dict, place: str,
         taken = datetime.fromisoformat(taken_at_iso)
         if taken.tzinfo is None:
             taken = taken.replace(tzinfo=timezone.utc)
-        delta_days = (delivered_at - taken).days
+        delta_days: int | None = (delivered_at - taken).days
     except (ValueError, TypeError):
-        delta_days = 0
+        delta_days = None
     sender = errand.get("sender", "无名")
+    # LOG-05: parse failure must not fabricate a "same-day" fact
+    if delta_days is None:
+        return f"{sender}的信送到了{place}。"
     if delta_days > 0:
         return f"{sender}的信送到了{place}。晚了{delta_days}天。"
     return f"{sender}的信送到了{place}。当天就到了。"

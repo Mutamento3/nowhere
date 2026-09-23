@@ -7,6 +7,7 @@ JSON — no large file parsing, no third-party parser dependencies.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import pathlib
@@ -183,7 +184,9 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
     place_name = ""
 
     if rng is None:
-        rng = _random.Random(hash((lat, lon, topic)))
+        # BND-07: hash() of a str is per-process randomised — seed must be stable
+        seed = int(hashlib.md5(f"{lat:.4f},{lon:.4f}|{topic}".encode("utf-8")).hexdigest(), 16)
+        rng = _random.Random(seed)
     kb = _load_local_kb()
 
     # ── 1. Exact match ──
@@ -201,12 +204,16 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
         for ch in set(title):
             for name in idx.get(ch, []):
                 if name in title:
-                    return _format_kb_entry(name, kb[name])
+                    entry = kb.get(name)
+                    if entry is not None:
+                        return _format_kb_entry(name, entry)
         # Backward: "故宫" is substring of "故宫博物院"
         for ch in set(title):
             for name in idx.get(ch, []):
                 if title in name:
-                    return _format_kb_entry(name, kb[name])
+                    entry = kb.get(name)
+                    if entry is not None:
+                        return _format_kb_entry(name, entry)
 
     # ── 3. Entity extraction: find KB keys mentioned in topic (卡88) ──
     # Only match keys >= 3 chars to avoid false positives
@@ -214,7 +221,9 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
     if title and not _has_topic_word:
         for name in sorted(kb.keys(), key=len, reverse=True):
             if len(name) >= 3 and name in title:
-                return _format_kb_entry(name, kb[name])
+                entry = kb.get(name)
+                if entry is not None:
+                    return _format_kb_entry(name, entry)
 
     # ── 4. Topic word mapping (卡88) ──
     # "这里的美食" / "这里的历史" / "这里的寺庙"
@@ -246,7 +255,9 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
         if place_name:
             for name, tags in _labels.items():
                 if place_name in name and tags:
-                    return _format_kb_entry(name, kb[name])
+                    entry = kb.get(name)
+                    if entry is not None:
+                        return _format_kb_entry(name, entry)
 
     # ── 6. Coordinate fallback (no topic) ──
     if not title:
@@ -321,7 +332,7 @@ def _t2s(text: str) -> str:
         converter = opencc.OpenCC("t2s")
         return converter.convert(text)
     except Exception:
-        return text
+        return text  # intentionally ignored: opencc optional
 
 
 def _strip_wiki_opening(text: str) -> str:

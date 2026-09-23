@@ -284,7 +284,7 @@ def _get_region(lat: float, lon: float) -> str:
 
 
 def _compose_walk_scene(surface: str, biome: str, rng: random.Random,
-                        lat: float = 0, lon: float = 0,
+                        lat: float | None = None, lon: float | None = None,
                         recent_scenes: list[str] | None = None) -> str:
     """Dynamically compose a walk description from biome-tagged elements.
 
@@ -315,7 +315,7 @@ def _compose_walk_scene(surface: str, biome: str, rng: random.Random,
                           if (t.get("text", t) if isinstance(t, dict) else t) not in recent]
 
     # Filter tropical-only content for non-tropical latitudes (Bug 2: bamboo)
-    abs_lat = abs(lat)
+    abs_lat = abs(lat) if lat is not None else 0
     if abs_lat > 30:  # not tropical
         tropical_keywords = ("竹", "竹林", "藤蔓", "猴子", "热带")
         def _not_tropical(item) -> bool:
@@ -326,7 +326,7 @@ def _compose_walk_scene(surface: str, biome: str, rng: random.Random,
         discovery_pool = [t for t in discovery_pool if _not_tropical(t)]
 
     # Filter by region tag (match current location's region)
-    region = _get_region(lat, lon) if lat or lon else "any"
+    region = _get_region(lat, lon) if lat is not None and lon is not None else "any"
     if region != "any":
         def _region_ok(item) -> bool:
             if isinstance(item, dict):
@@ -1327,26 +1327,26 @@ def _humidity_sensory(feels_c: float, temp_c: float, rng: random.Random) -> str:
 
 def render(
     kind: str,
-    payload: dict,
+    payload: dict | list,
     prev: dict | None,
     rng: random.Random,
     biome: str = "",
-    elevation: float = 0,
+    elevation: float | None = None,
     recent_scenes: list[str] | None = None,
     recent_touch: set[str] | None = None,
     season: str = "",
-    lat: float = 0.0,
+    lat: float | None = None,
 ) -> str:
     """渲染一种感官。优先用场景文件,兜底用模板。kind 见 _HANDLERS。"""
     # Try scene files for terrain/weather/water
     # Inject biome/elevation into payload for scene selection guards
     if isinstance(payload, dict):
-        scene_payload = {**payload, "biome": biome or payload.get("biome", ""), "elevation": elevation or payload.get("elevation", 0)}
+        scene_payload = {**payload, "biome": biome or payload.get("biome", ""), "elevation": elevation if elevation is not None else payload.get("elevation", 0)}
     else:
-        scene_payload = {"biome": biome, "elevation": elevation}
+        scene_payload = {"biome": biome, "elevation": elevation if elevation is not None else 0}
     scene = _scene_for_kind(kind, scene_payload, rng,
                             lat=scene_payload.get("lat", lat),
-                            lon=scene_payload.get("lon", 0.0),
+                            lon=scene_payload.get("lon"),
                             recent_scenes=recent_scenes)
     if scene:
         return scene
@@ -1360,7 +1360,7 @@ def render(
     # Card 33: set season/lat context for structured filtering
     global _CURRENT_SEASON, _CURRENT_LAT
     _CURRENT_SEASON = season or ""
-    _CURRENT_LAT = lat or 0.0
+    _CURRENT_LAT = lat if lat is not None else 0.0
     # Pass recent_touch to terrain handler via module-level variable
     global _RECENT_TOUCH
     _RECENT_TOUCH = recent_touch or set()
@@ -1371,7 +1371,7 @@ def render(
 
 
 def _scene_for_kind(kind: str, payload: dict, rng: random.Random,
-                    lat: float = 0.0, lon: float = 0.0,
+                    lat: float | None = None, lon: float | None = None,
                     recent_scenes: list[str] | None = None) -> str | None:
     """Try scene files for terrain/weather/water. Combinatorial > location > generic."""
     scene_name = ""
@@ -1383,9 +1383,6 @@ def _scene_for_kind(kind: str, payload: dict, rng: random.Random,
         # Skip scene files when payload has non-zero numeric data --
         # scene files are literary and don't embed numbers like elevation.
         if payload.get("elevation", 0) > 0 or payload.get("slope_deg", 0) > 0:
-            return None
-        # At high altitude, terrain is specific -- don't use generic scenes
-        if elevation and elevation > 3000:
             return None
 
         # 1. Try combinatorial system first (biome-tagged, region-aware)
@@ -1405,9 +1402,6 @@ def _scene_for_kind(kind: str, payload: dict, rng: random.Random,
 
         # 3. Fall back to generic biome scenes (old scene_*.txt)
         scene_name = _SURFACE_TO_SCENE.get(surface, "")
-        # Biome guard: mountain+rock should only use mountain scenes
-        if biome == "mountain" and surface == "rock" and scene_name not in ("mountains", ""):
-            return None
         # Biome guard: city should only use urban scenes
         if biome == "city" and scene_name not in ("urban", ""):
             return None
@@ -1418,7 +1412,7 @@ def _scene_for_kind(kind: str, payload: dict, rng: random.Random,
         if biome == "tundra" and scene_name == "deserts":
             return None
         # Surface guard: water surfaces should only use water scenes
-        if surface in ("water_ocean", "water_fresh") and scene_name != "water":
+        if surface in ("water_ocean", "water_fresh") and scene_name not in ("ocean", "water", "water_features"):
             return None
     elif kind == "weather":
         precip = payload.get("precip", "none")
@@ -1453,7 +1447,7 @@ def _scene_for_kind(kind: str, payload: dict, rng: random.Random,
         if filtered:
             pool = filtered
     # Location-dependent offset: different places get different scenes
-    if lat or lon:
+    if lat is not None and lon is not None:
         _location_offset(rng, lat, lon)
     return rng.choice(pool)
 
@@ -1542,10 +1536,6 @@ def _assign_narrative_roles(n: int, rng: random.Random) -> list[str]:
     roles: list[str] = ["开场"] + ["深入"] * (n - 1)
 
     if n >= 3:
-        # Last section: 50% chance of 余韵
-        if rng.random() < 0.5:
-            roles[n - 1] = "余韵"
-
         # Turning points at 1/3 and 2/3 of the sequence
         t1 = max(1, n // 3)
         t2 = max(t1 + 1, 2 * n // 3)
@@ -1554,6 +1544,12 @@ def _assign_narrative_roles(n: int, rng: random.Random) -> list[str]:
             roles[t1] = "转折"
         if t2 < n:
             roles[t2] = "转折"
+
+        # Last section: 50% chance of 余韵.
+        # FLOW-01: written AFTER 转折 so the ending role wins — at n==3, t2 == n-1,
+        # and assigning 转折 last used to clobber 余韵 every time.
+        if rng.random() < 0.5:
+            roles[n - 1] = "余韵"
 
     return roles
 
@@ -2091,7 +2087,9 @@ def _render_water(payload: dict, prev: dict | None, rng: random.Random) -> str:
 
 def _render_life(payload: dict, prev: dict | None, rng: random.Random) -> str:
     common_name = payload.get("common_name", "未知生物")
-    distance_m = payload.get("distance_m") or 100
+    distance_m = payload.get("distance_m")
+    if distance_m is None:
+        distance_m = 100
     seen_at = payload.get("seen_at", "")
     unit = payload.get("unit", "一只")
     time_desc = seen_at if seen_at else "不久前"
@@ -2170,6 +2168,8 @@ def _render_art(payload: dict, prev: dict | None, rng: random.Random) -> str:
             if idx > 50:
                 extract = extract[: idx + 1]
                 break
+        if len(extract) < len(zim):
+            extract += "……"
         return f"{artist}《{title}》。{extract}"
 
     # Fallback to Met metadata + scene
@@ -2753,21 +2753,14 @@ def render_establish(payload: dict, rng: random.Random) -> str:
         scene_pool = _load_scenes(scene_name)
     if not scene_pool and biome in _BIOME_TO_SCENE:
         scene_name = _BIOME_TO_SCENE[biome]
-        # Biome guard: city biome should only use urban scenes
-        if biome == "city" and scene_name != "urban":
-            pass
-        # Biome guard: mountain+rock should only use mountain scenes
-        elif biome == "mountain" and surface == "rock" and scene_name not in ("mountains",):
-            pass
-        else:
-            scene_pool = _load_scenes(scene_name)
+        scene_pool = _load_scenes(scene_name)
     if not scene_pool and surface in _SURFACE_TO_SCENE:
         scene_name = _SURFACE_TO_SCENE[surface]
         # At high altitude, skip water/river scenes
-        if elevation and elevation > 3000 and scene_name in ("water",):
+        if elevation and elevation > 3000 and scene_name in ("ocean", "water", "water_features"):
             pass
         # Surface guard: water surfaces should only use water scenes
-        elif surface in ("water_ocean", "water_fresh") and scene_name != "water":
+        elif surface in ("water_ocean", "water_fresh") and scene_name not in ("ocean", "water", "water_features"):
             pass
         # Biome guard: coast/tundra should not get desert scenes
         elif biome in ("coast", "tundra") and scene_name == "deserts":
@@ -2787,7 +2780,7 @@ def render_establish(payload: dict, rng: random.Random) -> str:
     if scene_pool and scene_name:
         scene_text = _pick_scene(scene_pool, scene_name, rng, ctx)
         # 30% chance to use seasonal variant instead of generic
-        if rng.random() < 0.3:
+        if scene_text and rng.random() < 0.3:
             seasonal_data = _load_seasonal()
             season_zh = _SEASON_EN_TO_ZH.get(season, "")
             # 1. Try exact place name match
@@ -2817,16 +2810,20 @@ def render_establish(payload: dict, rng: random.Random) -> str:
                 seasonal_pool = _load_scenes(season)
                 if seasonal_pool:
                     scene_text = rng.choice(seasonal_pool)
-        parts = [header, scene_text]
-        if time_scene and time_scene != scene_text:
-            parts.append(time_scene)
-        # 附近地标——单独加，不跟其他钩子竞争
-        nearby_places = payload.get("nearby_places", "")
-        if nearby_places:
-            parts.append(nearby_places)
-        # Bug 4: try to add local soundscape/taste for this place
-        _append_local_flavor(parts, place, rng)
-        return "".join(parts)
+        # ERR-02: _pick_scene can return "" (meta/season filter killed the pool).
+        # An empty scene_text is a failure, not a success — fall through to the
+        # template system instead of emitting a title-only establishing shot.
+        if scene_text:
+            parts = [header, scene_text]
+            if time_scene and time_scene != scene_text:
+                parts.append(time_scene)
+            # 附近地标——单独加，不跟其他钩子竞争
+            nearby_places = payload.get("nearby_places", "")
+            if nearby_places:
+                parts.append(nearby_places)
+            # Bug 4: try to add local soundscape/taste for this place
+            _append_local_flavor(parts, place, rng)
+            return "".join(parts)
 
     # ── Fallback: template system ─────────────────────────────────────
     surface_zh = _SURFACE_ZH.get(surface, "大地")
@@ -2936,7 +2933,7 @@ def _load_wf_scenes() -> dict:
     return _WF_SCENES_CACHE
 
 
-def _render_water_features(payload: dict, prev: dict | None, rng: random.Random) -> str:
+def _render_water_features(payload: dict | list, prev: dict | None, rng: random.Random) -> str:
     """水文描写: 河流/湖泊/瀑布/溪流。
 
     Card 33: reads biome-specific product file (scene_water_{biome}.txt),

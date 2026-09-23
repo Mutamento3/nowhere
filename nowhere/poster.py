@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 import pathlib
 import sys
 
@@ -15,6 +17,8 @@ _SCRIPT = _ROOT / "tools" / "maptoposter" / "create_map_poster.py"
 OUT_DIR = pathlib.Path(__file__).resolve().parent / "static" / "postcards"
 
 _available: bool | None = None
+
+logger = logging.getLogger(__name__)
 
 
 def available() -> bool:
@@ -29,6 +33,7 @@ def available() -> bool:
                 and (_SCRIPT.parent / "themes" / "nowhere_paper.json").exists()
             )
         except Exception:
+            logger.warning("osmnx availability check failed", exc_info=True)
             _available = False
     return _available
 
@@ -116,7 +121,8 @@ def blank(out_path: pathlib.Path, place: str, lat: float, lon: float, surface: s
         f_big = FontProperties(fname=font_path, size=34) if font_path else FontProperties(size=34)
         f_small = FontProperties(fname=font_path, size=13) if font_path else FontProperties(size=13)
 
-        seed = abs(hash(place)) % (2**32)
+        # BND-07: hash(str) is per-process randomised — use a stable digest
+        seed = int(hashlib.md5(place.encode("utf-8")).hexdigest(), 16) % (2**32)
         rng = np.random.default_rng(seed)
         ink = "#4a3b2c"
         paper = "#f5f0e6"
@@ -187,4 +193,5 @@ def blank(out_path: pathlib.Path, place: str, lat: float, lon: float, surface: s
         plt.close(fig)
         return True
     except Exception:
+        logger.warning("poster render failed", exc_info=True)
         return False

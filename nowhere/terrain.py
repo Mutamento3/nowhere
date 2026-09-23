@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import pathlib
+import threading
 from typing import Final
 
 import numpy as np
@@ -18,12 +19,6 @@ import numpy as np
 _DATA_DIR: Final = pathlib.Path(__file__).resolve().parent / "data"
 _TINY_PATH: Final = _DATA_DIR / "grid_tiny.npz"
 _FULL_PATH: Final = _DATA_DIR / "grid.npz"
-
-# Placeholder: no download helper exists yet.  When one is written it should
-# pull from the real repo's release (mengrru/nowhere).  Currently unused.
-GRID_URL: Final[str] = (
-    "https://github.com/mengrru/nowhere/releases/download/v0.1/grid.npz"
-)
 
 # Cover codes (must match build_grid.py)
 _SURFACE_MAP: Final[list[str]] = [
@@ -44,6 +39,9 @@ _EARTH_RADIUS_KM: Final = 6371.0
 
 # ── Grid loading ────────────────────────────────────────────────────
 
+# CON-03: module-level caches are hit from asyncio.to_thread workers.
+_CACHE_LOCK = threading.Lock()
+
 _elev: np.ndarray | None = None
 _cover: np.ndarray | None = None
 
@@ -63,66 +61,68 @@ def _load_tile_index() -> dict[str, dict]:
     correct tile without loading every elev array into memory.
     """
     global _TILE_INDEX
-    if _TILE_INDEX is not None:
+    with _CACHE_LOCK:
+        if _TILE_INDEX is not None:
+            return _TILE_INDEX
+        _TILE_INDEX = {}
+        if not _TILE_INDEX_PATH.exists():
+            return _TILE_INDEX
+        raw = _json.loads(_TILE_INDEX_PATH.read_text(encoding="utf-8"))
+        for key, val in raw.items():
+            if isinstance(val, dict):
+                # New format: {"file": "tile_...", "lat_min": ..., "lat_max": ..., ...}
+                entry: dict = {
+                    "fname": val["file"],
+                    "lat_min": float(val["lat_min"]),
+                    "lat_max": float(val["lat_max"]),
+                    "lon_min": float(val["lon_min"]),
+                    "lon_max": float(val["lon_max"]),
+                }
+            else:
+                # Legacy format: plain filename string
+                fname: str = val
+                entry = {"fname": fname}
+                try:
+                    with np.load(_TILES_DIR / fname) as data:
+                        entry["lat_min"] = float(data["lat_min"])
+                        entry["lat_max"] = float(data["lat_max"])
+                        entry["lon_min"] = float(data["lon_min"])
+                        entry["lon_max"] = float(data["lon_max"])
+                except Exception:
+                    continue  # intentionally ignored: per-tile tolerance, skip corrupt/missing tiles
+            _TILE_INDEX[key] = entry
         return _TILE_INDEX
-    _TILE_INDEX = {}
-    if not _TILE_INDEX_PATH.exists():
-        return _TILE_INDEX
-    raw = _json.loads(_TILE_INDEX_PATH.read_text(encoding="utf-8"))
-    for key, val in raw.items():
-        if isinstance(val, dict):
-            # New format: {"file": "tile_...", "lat_min": ..., "lat_max": ..., ...}
-            entry: dict = {
-                "fname": val["file"],
-                "lat_min": float(val["lat_min"]),
-                "lat_max": float(val["lat_max"]),
-                "lon_min": float(val["lon_min"]),
-                "lon_max": float(val["lon_max"]),
-            }
-        else:
-            # Legacy format: plain filename string
-            fname: str = val
-            entry = {"fname": fname}
-            try:
-                with np.load(_TILES_DIR / fname) as data:
-                    entry["lat_min"] = float(data["lat_min"])
-                    entry["lat_max"] = float(data["lat_max"])
-                    entry["lon_min"] = float(data["lon_min"])
-                    entry["lon_max"] = float(data["lon_max"])
-            except Exception:
-                continue  # intentionally ignored: per-tile tolerance, skip corrupt/missing tiles
-        _TILE_INDEX[key] = entry
-    return _TILE_INDEX
 
 
 def _load_tile(fname: str) -> dict | None:
     """Load a tile .npz into cache. Returns the tile dict."""
-    if fname in _TILE_CACHE:
-        # Move to end (most recently used)
-        _TILE_CACHE[fname] = _TILE_CACHE.pop(fname)
-        return _TILE_CACHE[fname]
+    with _CACHE_LOCK:
+        if fname in _TILE_CACHE:
+            # Move to end (most recently used)
+            _TILE_CACHE[fname] = _TILE_CACHE.pop(fname)
+            return _TILE_CACHE[fname]
 
-    path = _TILES_DIR / fname
-    try:
-        data = np.load(path)
-    except Exception:
-        return None  # intentionally ignored: tile load failure, caller handles None
-    tile = {
-        "elev": data["elev"],
-        "surface": data["surface"],
-        "lat_min": float(data["lat_min"]),
-        "lat_max": float(data["lat_max"]),
-        "lon_min": float(data["lon_min"]),
-        "lon_max": float(data["lon_max"]),
-        "shape": tuple(int(x) for x in data["elev"].shape),
-    }
+        path = _TILES_DIR / fname
+        try:
+            with np.load(path) as data:
+                tile = {
+                    "elev": data["elev"],
+                    "surface": data["surface"],
+                    "lat_min": float(data["lat_min"]),
+                    "lat_max": float(data["lat_max"]),
+                    "lon_min": float(data["lon_min"]),
+                    "lon_max": float(data["lon_max"]),
+                    "shape": tuple(int(x) for x in data["elev"].shape),
+                }
+        except Exception:
+            return None  # intentionally ignored: tile load failure, caller handles None
 
-    # Evict oldest if cache is full
-    while len(_TILE_CACHE) >= _TILE_CACHE_MAX:
-        _TILE_CACHE.pop(next(iter(_TILE_CACHE)))
+        # Evict oldest if cache is full
+        while len(_TILE_CACHE) >= _TILE_CACHE_MAX:
+            _TILE_CACHE.pop(next(iter(_TILE_CACHE)))
 
-    _TILE_CACHE[fname] = tile
-    return tile
+        _TILE_CACHE[fname] = tile
+        return tile
 
 
 def _find_tile(lat: float, lon: float) -> dict | None:
@@ -197,10 +197,11 @@ _POOL_RADIUS_DEG: Final = 0.15  # ~15km 内优先用池里的真实值
 
 def _load_pool() -> list[dict]:
     global _pool
-    if _pool is None:
-        path = _DATA_DIR / "pool.json"
-        _pool = _json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
-    return _pool
+    with _CACHE_LOCK:
+        if _pool is None:
+            path = _DATA_DIR / "pool.json"
+            _pool = _json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        return _pool
 
 
 # ── 城市掩码(cities15000,人口>5万的城市附近算 urban)────────────
@@ -210,22 +211,23 @@ _cities: list[tuple[float, float]] | None = None
 
 def _load_cities() -> list[tuple[float, float]]:
     global _cities
-    if _cities is not None:
+    with _CACHE_LOCK:
+        if _cities is not None:
+            return _cities
+        _cities = []
+        path = _DATA_DIR / "packs" / "cities15000.txt"
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 15:
+                        continue
+                    try:
+                        if int(parts[14] or 0) >= 50000:
+                            _cities.append((float(parts[4]), float(parts[5])))
+                    except ValueError:
+                        continue  # intentionally ignored: malformed city data line
         return _cities
-    _cities = []
-    path = _DATA_DIR / "packs" / "cities15000.txt"
-    if path.exists():
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) < 15:
-                    continue
-                try:
-                    if int(parts[14] or 0) >= 50000:
-                        _cities.append((float(parts[4]), float(parts[5])))
-                except ValueError:
-                    continue  # intentionally ignored: malformed city data line
-    return _cities
 
 
 def urban_nearby(lat: float, lon: float, km: float = 15.0) -> bool:
@@ -254,16 +256,44 @@ def _pool_entry(lat: float, lon: float) -> dict | None:
     return best
 
 
+def pool_biome(lat: float, lon: float, place_name: str = "") -> str | None:
+    """Return the hand-tagged ``biome`` of the nearest pool spot, else None.
+
+    A10: pool.json authors a ``biome`` per landing spot (all 329 carry one).
+    Prefer that over inferring biome from surface cover — the grid can say
+    "grass" over a city.  Unlike :func:`_pool_entry` this does not require an
+    ``elev_m`` column (258 of the 329 spots omit it).
+
+    *place_name* — same bidirectional ``name_hint`` guard as :func:`elevation`
+    (Card 81), so a nearby landmark's biome cannot clobber this place's.
+    """
+    best: str | None = None
+    best_d = _POOL_RADIUS_DEG
+    for e in _load_pool():
+        if "biome" not in e:
+            continue
+        if place_name and e.get("name_hint"):
+            hint = e["name_hint"]
+            if hint not in place_name and place_name not in hint:
+                continue  # name mismatch → this spot is a different place
+        d = abs(e["lat"] - lat) + abs((e["lon"] - lon) * math.cos(math.radians(lat)))
+        if d < best_d:
+            best_d = d
+            best = e["biome"]
+    return best
+
+
 def _load_grid() -> None:
     """Load the best available grid into module-level arrays."""
     global _elev, _cover
-    if _elev is not None:
-        return
+    with _CACHE_LOCK:
+        if _elev is not None:
+            return
 
-    path = _FULL_PATH if _FULL_PATH.exists() else _TINY_PATH
-    data = np.load(path)
-    _elev = data["elev"]  # int16 [181, 360]
-    _cover = data["cover"]  # uint8 [181, 360]
+        path = _FULL_PATH if _FULL_PATH.exists() else _TINY_PATH
+        with np.load(path) as data:
+            _elev = data["elev"]  # int16 [181, 360]
+            _cover = data["cover"]  # uint8 [181, 360]
 
 
 def _ensure_loaded() -> None:
@@ -328,8 +358,10 @@ def elevation(lat: float, lon: float, place_name: str = "") -> float:
     """Return interpolated elevation in metres at (*lat*, *lon*).
 
     Priority: pool baked values > tile data > **DEM column** > grid_tiny.
-    If the grid/tile value differs from DEM by >100m, trust DEM (cities15000
-    column 16 has SRTM-corrected elevations for named cities).
+    Only the grid fallback path consults DEM: if the grid value is a fill
+    value or differs from DEM by >100m, trust DEM (cities15000 column 16 has
+    SRTM-corrected elevations for named cities).  Tile hits return early and
+    are never cross-checked against DEM.
 
     *place_name* — when given, pool entries are only used if their
     ``name_hint`` is a substring of *place_name*.  This prevents a nearby

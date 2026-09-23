@@ -36,33 +36,21 @@ def _load_fallback() -> list[dict]:
         with open(_FALLBACK_PATH, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return []
+        return []  # intentionally ignored: fallback data missing
 
 
 def _pick_nearest_from_fallback(lat: float, lon: float, country_code: str | None = None) -> dict | None:
     """Pick the fallback station closest to (lat, lon) by haversine distance.
 
-    Priority: same country > same culture circle > same continent > global.
-    All fallback entries have ``lat``/``lon`` fields. If the nearest station
-    is within 3000 km, return it. Otherwise, use a region-aware fallback.
+    With a known *country_code*, only same-country stations are eligible
+    (Card 71: Budapest ≠ CZ) and the nearest one wins outright.  Without one,
+    the globally nearest station is taken if it is within 3000 km, else the
+    nearest among the closest region's representative countries.
 
-    Returns *None* only if no stations are available.
+    All fallback entries have ``lat``/``lon`` fields.  Returns *None* only if
+    no eligible station is available.
     """
     _MAX_NEARBY_KM: Final = 3000.0
-
-    # Culture circles: countries grouped by language/cultural proximity
-    # Fallback within a circle is preferred over nearest-geographic
-    _CULTURE_CIRCLES: dict[str, list[str]] = {
-        "arabic":    ["EG", "LY", "TN", "DZ", "MA", "SA", "AE", "JO", "IQ", "SY", "LB", "YE", "OM", "QA", "KW", "BH", "SD"],
-        "turkic":    ["TR", "KG"],
-        "persian":   ["IR"],
-        "south_asia":["IN", "PK", "BD"],
-        "east_asia": ["CN", "KR", "JP", "VN", "TH", "ID", "MY", "PH", "KH", "MM"],
-        "europe":    ["GB", "FR", "DE", "NO", "IS", "CZ", "IT", "UA"],
-        "americas":  ["US", "CA", "BR", "AR", "PE", "CO", "CL", "MX", "BO"],
-        "africa":    ["KE", "TZ", "ZA", "CM", "ET", "GH", "NG"],
-        "oceania":   ["AU", "NZ", "FJ"],
-    }
 
     # Regional representative stations (picked from fallback list by country)
     _REGION_REPS: dict[str, list[str]] = {
@@ -107,19 +95,7 @@ def _pick_nearest_from_fallback(lat: float, lon: float, country_code: str | None
         if same_country is not None:
             return same_country
 
-    # 2. Same culture circle (Card 71: cc mismatch rejection — Budapest ≠ CZ)
-    if country_code:
-        for _circle_name, circle_ccs in _CULTURE_CIRCLES.items():
-            if country_code in circle_ccs:
-                # Only match stations from the SAME country within the circle
-                same_cc_stations = [cc for cc in circle_ccs if cc == country_code]
-                if same_cc_stations:
-                    circle_st = _find_nearest(same_cc_stations)
-                    if circle_st is not None:
-                        return circle_st
-                break
-
-    # 3. Find globally nearest station (Card 71: cc mismatch rejection)
+    # 2. Find globally nearest station (Card 71: cc mismatch rejection)
     best: dict | None = None
     best_dist = math.inf
     for st in stations:
@@ -233,12 +209,16 @@ async def nearest(lat: float, lon: float, country_code: str | None, rng: random.
                                 best_d = d
                                 best = st
                         st = best or data[0]
-                        return {
-                            "name": st.get("name", "Unknown"),
+                        name = st.get("name") or "Unknown"
+                        result = {
+                            "name": name,
                             "genre": st.get("tags", ""),
                             "stream_url": st.get("url_resolved", st.get("url", "")),
                             "homepage": st.get("homepage", ""),
                         }
+                        if not st.get("name"):
+                            result["source"] = "fallback"
+                        return result
                 except (httpx.HTTPError, httpx.TimeoutException, ValueError):
                     continue  # intentionally ignored: per-station network failure, try next
 

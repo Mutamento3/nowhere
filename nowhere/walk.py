@@ -16,9 +16,10 @@ _WATER_SPEED_KMH = 1.5
 _SLOPE_SLOW_THRESHOLD_DEG = 20.0
 _CLIFF_THRESHOLD_DEG = 45.0
 _LAT_LIMIT = 85.0  # beyond ±85° latitude: honest "no further north/south"
+_COMPASS_DIRS = 8  # candidate bearings sampled per scan (semantic / ocean search)
 _SEMANTIC_DIRECTIONS = {
-    "uphill": 8,   # try all 8 directions
-    "toward_sea": 8,
+    "uphill": _COMPASS_DIRS,
+    "toward_sea": _COMPASS_DIRS,
 }
 
 # ── Latitude limit closing variants (Card 40: honest boundaries) ────
@@ -56,8 +57,10 @@ def _pick_semantic_bearing(
     best_delta = 0.0
     e_here = terrain.elevation(lat, lon)
 
-    for i in range(8):
-        bearing = i * 45.0
+    n_dir = _SEMANTIC_DIRECTIONS.get(semantic, _COMPASS_DIRS)
+    step = 360.0 / n_dir
+    for i in range(n_dir):
+        bearing = i * step
         dest_lat, dest_lon = terrain.destination(lat, lon, bearing, dist_km)
         e_dest = terrain.elevation(dest_lat, dest_lon)
         delta = e_dest - e_here
@@ -88,12 +91,21 @@ def best_uphill_gain(state: WorldState, dist_km: float = 2.0) -> float:
     return best_delta
 
 
-def water_ahead_km(lat: float, lon: float, bearing_deg: float, max_km: float = 20.0) -> float | None:
-    """沿方位往前走,多少公里内能碰到海洋(每 1km 采样)。碰不到返回 None。"""
+def water_ahead_km(lat: float, lon: float, bearing_deg: float, max_km: float = 20.0,
+                   include_fresh: bool = False) -> float | None:
+    """沿方位往前走,多少公里内能碰到水(每 1km 采样)。碰不到返回 None。
+
+    include_fresh=False 时只检测海水(toward_sea 语义);
+    include_fresh=True 时检测所有水体(阻挡闸门用)。
+    """
     d = 1.0
     while d <= max_km:
         lat2, lon2 = terrain.destination(lat, lon, bearing_deg, d)
-        if terrain.is_water(lat2, lon2):
+        if include_fresh:
+            is_target = terrain.is_water(lat2, lon2)
+        else:
+            is_target = terrain.surface(lat2, lon2) == "water_ocean"
+        if is_target:
             # Card 64: coarse-grid false-ocean gate.  Real ocean is at sea
             # level; "water_ocean" above 1000 m is a grid artifact.
             if terrain.elevation(lat2, lon2) > 1000:
@@ -113,8 +125,9 @@ def nearest_ocean_km_and_bearing(
     """
     min_km: float | None = None
     min_bearing: float | None = None
-    for i in range(8):
-        bearing = i * 45.0
+    step = 360.0 / _COMPASS_DIRS
+    for i in range(_COMPASS_DIRS):
+        bearing = i * step
         d = water_ahead_km(lat, lon, bearing, max_km=max_km)
         if d is not None:
             if min_km is None or d < min_km:
@@ -133,7 +146,11 @@ def step(
     """Execute one walking step and update state.
 
     Returns {"blocked", "reason", "entered_water", "elevation_delta",
-             "slope_deg", "dist_km", "new_surface", "climbed"}.
+             "slope_deg", "dist_km", "new_surface", "climbed", "no_gain",
+             "far_slope", "sea_ahead_km", "clamped", "lat_limit"}.
+
+    DATA-05: every exit returns the same key set — callers must never have to
+    guess which keys a particular path happened to populate.
 
     max_dist: override the maximum distance per step (Card 50: fatigue cap).
     """
@@ -173,6 +190,8 @@ def step(
                     "no_gain": True,
                     "far_slope": None,
                     "sea_ahead_km": None,
+                    "clamped": clamped,
+                    "lat_limit": False,
                 }
     else:
         bearing = _bearing_from_path(state.path)
@@ -199,7 +218,7 @@ def step(
     was_on_land = not terrain.is_water(lat, lon)
     if was_on_land and dest_surface in ("water_ocean", "water_fresh"):
         # Check distance to water
-        water_dist = water_ahead_km(lat, lon, bearing, max_km=10.0)
+        water_dist = water_ahead_km(lat, lon, bearing, max_km=10.0, include_fresh=True)
         if water_dist is not None and water_dist >= 5.0:
             # Blocked but distance still accumulates (you walked there)
             state.total_distance_km += dist_km
@@ -212,6 +231,11 @@ def step(
                 "dist_km": dist_km,
                 "new_surface": terrain.surface(lat, lon),
                 "climbed": False,
+                "no_gain": no_gain,
+                "far_slope": far_slope,
+                "sea_ahead_km": None,
+                "clamped": clamped,
+                "lat_limit": lat_limit_reached,
                 "water_distance_km": water_dist,
             }
 
@@ -232,9 +256,12 @@ def step(
             "dist_km": dist_km,
             "new_surface": terrain.surface(lat, lon),
             "climbed": False,
+            "no_gain": no_gain,
+            "far_slope": far_slope,
+            "sea_ahead_km": None,
+            "clamped": clamped,
+            "lat_limit": lat_limit_reached,
         }
-        if clamped:
-            result["clamped"] = True
         return result
 
     # ── Elevation delta ──────────────────────────────────────────────
@@ -290,9 +317,7 @@ def step(
         "no_gain": no_gain,
         "far_slope": far_slope,  # (bearing, gain_m)|None:近处没坡但远处有
         "sea_ahead_km": sea_ahead,
+        "clamped": clamped,
+        "lat_limit": lat_limit_reached,
     }
-    if clamped:
-        result["clamped"] = True
-    if lat_limit_reached:
-        result["lat_limit"] = True
     return result
