@@ -355,7 +355,8 @@ def elevation(lat: float, lon: float, place_name: str = "") -> float:
         return elev_val
     # Fall back to global grid
     _ensure_loaded()
-    assert _elev is not None
+    if _elev is None:
+        raise RuntimeError("elevation grid not loaded")
     row, col = _latlon_to_grid(lat, lon)
     grid_elev = float(_bilinear(_elev.astype(np.float32), row, col))
     # DEM override: if grid is fill value (~300) OR differs from DEM by >100m,
@@ -384,7 +385,8 @@ def surface(lat: float, lon: float) -> str:
         return surf_val
     # Fall back to global grid
     _ensure_loaded()
-    assert _cover is not None
+    if _cover is None:
+        raise RuntimeError("cover grid not loaded")
     row, col = _latlon_to_grid(lat, lon)
     # For cover, use nearest-neighbour (categorical data)
     r = max(0, min(int(round(row)), _cover.shape[0] - 1))

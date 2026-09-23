@@ -203,7 +203,8 @@ def nearby_place(
     优先级: 目的地 > 距离最近 > 事件 > 人物 > 作品。
     """
     _load()
-    assert _places is not None
+    if _places is None:
+        raise RuntimeError("humanities data not loaded")
 
     # 收集范围内的地名(带距离)
     candidates: list[tuple[str, float]] = []

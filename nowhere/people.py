@@ -13,10 +13,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import pathlib
 import random
 import sys
+
+logger = logging.getLogger(__name__)
 
 _DATA_DIR = pathlib.Path(__file__).resolve().parent / "data"
 _SEED_FILE = _DATA_DIR / "people_seed.json"
@@ -41,11 +44,11 @@ def _load() -> dict:
     except Exception:
         pass  # intentionally ignored: stdout reconfigure may fail on some terminals
     if not _SEED_FILE.exists():
-        print("[people] seed file missing", flush=True)
+        logger.debug("[people] seed file missing")
         _data = {}
         return _data
     _data = json.loads(_SEED_FILE.read_text(encoding="utf-8"))
-    print(f"[people] loaded {len(_data)} people", flush=True)
+    logger.debug("[people] loaded %d people", len(_data))
     return _data
 
 
