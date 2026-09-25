@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import random
+
+logger = logging.getLogger(__name__)
 
 _DATA_DIR = pathlib.Path(__file__).resolve().parent / "data"
 _POOL_PATH = _DATA_DIR / "pool.json"
@@ -46,15 +49,21 @@ def _load_patch_jitter() -> dict[str, float]:
     """
     global _patch_jitter
     if _patch_jitter is None:
-        _patch_jitter = {}
+        patch: dict[str, float] = {}
         if _PATCH_PATH.exists():
             try:
                 data = json.loads(_PATCH_PATH.read_text(encoding="utf-8"))
-                for name, info in data.items():
-                    if isinstance(info, dict) and "jitter_deg" in info:
-                        _patch_jitter[name] = float(info["jitter_deg"])
-            except (json.JSONDecodeError, OSError):
-                pass  # intentionally ignored: corrupt or missing jitter patch file
+                if isinstance(data, dict):
+                    for name, info in data.items():
+                        if isinstance(info, dict) and "jitter_deg" in info:
+                            patch[name] = float(info["jitter_deg"])
+                else:
+                    logger.warning("places_patch.json 顶层不是 dict, jitter 全部失效")
+            except (json.JSONDecodeError, OSError, ValueError, TypeError) as exc:
+                # 非数值/为 null 的 jitter_deg 同属"损坏", 留日志防静默失效
+                logger.warning("places_patch.json 读取失败, jitter 全部失效: %s", exc)
+        # 完整构建后才发布缓存, 中途失败不会把半成品钉死在全局
+        _patch_jitter = patch
     return _patch_jitter
 
 
@@ -108,13 +117,17 @@ def nudge_if_water(
     if _is_water_destination(name_hint):
         return {"lat": lat, "lon": lon}
 
-    # Search for nearest land using terrain grid
+    # Search for nearest land using pool data first, then terrain grid
     for step in (0.35, 0.5, 0.7):
         for dlat, dlon in _NUDGE_DIRS:
             scale = step / 0.5
             nlat = lat + dlat * scale
             nlon = lon + dlon * scale
-            ns = terrain_surface(nlat, nlon)
+            # 候选点与起点同源: 先查手核 pool, 网格只做兜底。候选点可能落在
+            # 另一条标 water 的 pool 条目附近, 只查网格会把手核水面误判成陆
+            ns = _pool_surface_for(nlat, nlon)
+            if ns is None:
+                ns = terrain_surface(nlat, nlon)
             if not ns.startswith("water"):
                 return {"lat": nlat, "lon": nlon}
 
@@ -140,5 +153,6 @@ def random_spot(rng: random.Random) -> dict:
         "lat": spot["lat"] + rng.uniform(-0.1, 0.1),
         "lon": spot["lon"] + rng.uniform(-0.1, 0.1),
         "biome": spot["biome"],
-        "name_hint": spot["name_hint"],
+        # pool.json 的 name_hint 非保证键(其余读取方均按可选键处理)
+        "name_hint": spot.get("name_hint", ""),
     }

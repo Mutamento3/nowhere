@@ -7,6 +7,7 @@ No network requests are made unless you explicitly call the download helper.
 
 from __future__ import annotations
 
+import json as _json
 import math
 import pathlib
 import threading
@@ -43,6 +44,7 @@ _EARTH_RADIUS_KM: Final = 6371.0
 _CACHE_LOCK = threading.Lock()
 
 _elev: np.ndarray | None = None
+_elev_f32: np.ndarray | None = None
 _cover: np.ndarray | None = None
 
 # ── Tile cache (high-res elevation tiles, lazy-loaded, LRU) ────────
@@ -189,8 +191,6 @@ def _tile_bilinear(tile: dict, lat: float, lon: float) -> tuple[float, str]:
 
 # ── Pool override (baked real values near landing spots) ────────────
 
-import json as _json
-
 _pool: list[dict] | None = None
 _POOL_RADIUS_DEG: Final = 0.15  # ~15km 内优先用池里的真实值
 
@@ -207,14 +207,16 @@ def _load_pool() -> list[dict]:
 # ── 城市掩码(cities15000,人口>5万的城市附近算 urban)────────────
 
 _cities: list[tuple[float, float]] | None = None
+_city_buckets: dict[tuple[int, int], list[tuple[float, float]]] | None = None
 
 
 def _load_cities() -> list[tuple[float, float]]:
-    global _cities
+    global _cities, _city_buckets
     with _CACHE_LOCK:
         if _cities is not None:
             return _cities
-        _cities = []
+        cities: list[tuple[float, float]] = []
+        buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
         path = _DATA_DIR / "packs" / "cities15000.txt"
         if path.exists():
             with open(path, encoding="utf-8") as f:
@@ -224,30 +226,46 @@ def _load_cities() -> list[tuple[float, float]]:
                         continue
                     try:
                         if int(parts[14] or 0) >= 50000:
-                            _cities.append((float(parts[4]), float(parts[5])))
+                            c = (float(parts[4]), float(parts[5]))
+                            cities.append(c)
+                            buckets.setdefault((int(math.floor(c[0])), int(math.floor(c[1]))), []).append(c)
                     except ValueError:
                         continue  # intentionally ignored: malformed city data line
+        # 局部构建完再原子发布, 失败不会留下半填充缓存
+        _cities = cities
+        _city_buckets = buckets
         return _cities
 
 
 def urban_nearby(lat: float, lon: float, km: float = 15.0) -> bool:
-    """人口 5 万+ 城市 km 公里内 → True。"""
+    """人口 5 万+ 城市 km 公里内 → True。1° 分桶索引, 只扫邻桶。"""
+    global _city_buckets
+    _load_cities()
+    if not _city_buckets:
+        return False
     deg = km / 111.0
-    for clat, clon in _load_cities():
-        if abs(clat - lat) < deg and abs((clon - lon) * math.cos(math.radians(lat))) < deg:
-            return True
+    coslat = math.cos(math.radians(lat))
+    reach = int(math.ceil(deg))
+    blat, blon = int(math.floor(lat)), int(math.floor(lon))
+    for dlat in range(-reach, reach + 1):
+        for dlon in range(-reach, reach + 1):
+            for clat, clon in _city_buckets.get((blat + dlat, blon + dlon), ()):
+                if abs(clat - lat) < deg and abs((clon - lon) * coslat) < deg:
+                    return True
     return False
 
 
-def _pool_entry(lat: float, lon: float) -> dict | None:
+def _pool_entry(lat: float, lon: float, require_elev: bool = True) -> dict | None:
     """Nearest pool entry within _POOL_RADIUS_DEG, else None.
 
-    优先用烘焙值——地标坐标的精确海拔。
+    优先用烘焙值——地标坐标的精确海拔。require_elev=False 供 surface()
+    使用: 329 条里 258 条只有 surface 没有 elev_m, 卡着 elev_m 会让
+    surface() 的 pool 覆盖层完全失效, 退化为瓦片/网格推断值。
     """
     best: dict | None = None
     best_d = _POOL_RADIUS_DEG
     for e in _load_pool():
-        if "elev_m" not in e:
+        if require_elev and "elev_m" not in e:
             continue
         d = abs(e["lat"] - lat) + abs((e["lon"] - lon) * math.cos(math.radians(lat)))
         if d < best_d:
@@ -285,7 +303,7 @@ def pool_biome(lat: float, lon: float, place_name: str = "") -> str | None:
 
 def _load_grid() -> None:
     """Load the best available grid into module-level arrays."""
-    global _elev, _cover
+    global _elev, _cover, _elev_f32
     with _CACHE_LOCK:
         if _elev is not None:
             return
@@ -294,6 +312,8 @@ def _load_grid() -> None:
         with np.load(path) as data:
             _elev = data["elev"]  # int16 [181, 360]
             _cover = data["cover"]  # uint8 [181, 360]
+        # 浮点副本只做一次: 每次调用现转是 260KB 分配 + 6.5 万元素转换
+        _elev_f32 = _elev.astype(np.float32)
 
 
 def _ensure_loaded() -> None:
@@ -314,16 +334,16 @@ def _bilinear(arr: np.ndarray, row: float, col: float) -> float:
     """Bilinear interpolation on a [181, 360] grid."""
     nrows, ncols = arr.shape
 
-    r0 = int(math.floor(row))
+    # 先钳 r0 再算 r1: row < -1 时 r1 会是负数, numpy 负索引静默回绕
+    r0 = max(0, min(int(math.floor(row)), nrows - 1))
     c0 = int(math.floor(col))
     r1 = min(r0 + 1, nrows - 1)
     c1 = (c0 + 1) % ncols  # wrap longitude
 
-    # Clamp row
-    r0 = max(0, min(r0, nrows - 1))
-
     fr = row - math.floor(row)
     fc = col - math.floor(col)
+    fr = max(0.0, min(fr, 1.0))
+    fc = max(0.0, min(fc, 1.0))
 
     v00 = float(arr[r0, c0])
     v01 = float(arr[r0, c1])
@@ -370,7 +390,7 @@ def elevation(lat: float, lon: float, place_name: str = "") -> float:
     """
     from nowhere.dem import lookup as dem_lookup, is_fill_value
 
-    entry = _pool_entry(lat, lon)
+    entry = _pool_entry(lat, lon, require_elev=True)
     if entry is not None:
         # Card 81: only trust pool elevation when name matches place_name.
         # Match is bidirectional: "维苏威" matches "维苏威火山" and vice versa.
@@ -387,10 +407,10 @@ def elevation(lat: float, lon: float, place_name: str = "") -> float:
         return elev_val
     # Fall back to global grid
     _ensure_loaded()
-    if _elev is None:
+    if _elev_f32 is None:
         raise RuntimeError("elevation grid not loaded")
     row, col = _latlon_to_grid(lat, lon)
-    grid_elev = float(_bilinear(_elev.astype(np.float32), row, col))
+    grid_elev = float(_bilinear(_elev_f32, row, col))
     # DEM override: if grid is fill value (~300) OR differs from DEM by >100m,
     # trust the cities15000 DEM column (SRTM-corrected for named cities).
     dem_val = dem_lookup(lat, lon)
@@ -400,14 +420,22 @@ def elevation(lat: float, lon: float, place_name: str = "") -> float:
     return grid_elev
 
 
-def surface(lat: float, lon: float) -> str:
+def surface(lat: float, lon: float, place_name: str = "") -> str:
     """Return surface type string at (*lat*, *lon*).
 
     Priority: pool baked values > tile data > grid_tiny.
+
+    *place_name* — Card 81 同款双向 ``name_hint`` 守卫(与 elevation 一致):
+    传入时, 半径内地标条目的 surface 不得覆盖本地点。
     """
-    entry = _pool_entry(lat, lon)
+    entry = _pool_entry(lat, lon, require_elev=False)
     if entry is not None and "surface" in entry:
-        return entry["surface"]
+        if place_name and entry.get("name_hint"):
+            hint = entry["name_hint"]
+            if hint not in place_name and place_name not in hint:
+                entry = None  # name mismatch → fall through to tile/grid
+        if entry is not None:
+            return entry["surface"]
     # Try high-res tile
     tile = _find_tile(lat, lon)
     if tile is not None:
@@ -423,7 +451,9 @@ def surface(lat: float, lon: float) -> str:
     # For cover, use nearest-neighbour (categorical data)
     r = max(0, min(int(round(row)), _cover.shape[0] - 1))
     c = int(round(col)) % _cover.shape[1]
-    s = _SURFACE_MAP[int(_cover[r, c])]
+    code = int(_cover[r, c])
+    # 网格数据可能有超范围填充码(如 255 nodata), 与 _tile_bilinear 同防御
+    s = _SURFACE_MAP[code] if code < len(_SURFACE_MAP) else "unknown"
     # tiny 网格没有城市分类: 人口城市附近盖 urban(#13 #26)
     if s not in ("water_ocean", "water_fresh") and urban_nearby(lat, lon):
         return "urban"

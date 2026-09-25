@@ -1,7 +1,7 @@
 """Walk action registry -- Card 48.
 
 Each if-block in walk_impl becomes an Action with should() + render().
-Order = priority (节日/纪念日 > 时间轴 > 常规遭遇).
+Order = priority (荒深叙事 > 本地场景 > 收音机安静 > 节日/纪念日 > 时间轴 > 常规遭遇).
 No event bus -- synchronous two-step (判断 + 渲染).
 """
 
@@ -40,8 +40,9 @@ class WalkContext:
     quiet: bool = False
     sections: list[str] = field(default_factory=list)
     # Mutable inter-action state
+    # 顺序依赖: mishap_fired 由 MishapAction.resolve() 置位, 仅被紧随其后的
+    # MishapEchoAction.should() 读取 —— ACTIONS 中两者必须保持相邻顺序
     mishap_fired: bool = False
-    had_local: bool = False  # set by LocalSceneAction, read by direction connector
 
 
 # ── Protocol ────────────────────────────────────────────────────────
@@ -112,11 +113,13 @@ class TimeaxisAction:
             ctx.rng,
         )
         parts: list[str] = []
-        recent_set = set(ctx.state.recent_scenes)
+        seen = set(ctx.state.recent_scenes)
         for ta in layers:
-            if ta["text"] not in recent_set:
+            # 只读 recent_scenes 做去重, 不在此 append: 管线在步末会把所有
+            # 长 section 统一记账, Action 侧再记一次会占双倍去重窗口
+            if ta["text"] not in seen:
                 parts.append(ta["text"])
-                ctx.state.recent_scenes.append(ta["text"])
+                seen.add(ta["text"])
         return "\n".join(parts) if parts else None
 
 
@@ -131,23 +134,28 @@ class HumanitiesAction:
             return False
         return True
 
-    def render(self, ctx: WalkContext) -> str | None:
+    def resolve(self, ctx: WalkContext) -> None:
         from nowhere import describe, humanities, placememory
 
         card = humanities.nearby_place(
             ctx.lat, ctx.lon, ctx.state.seen_humanities, ctx.rng,
         )
         if not card:
-            return None
+            self._text = None
+            return
         ctx.state.seen_humanities.add(card["key"])
         placememory.save_seen_humanities(ctx.state.seen_humanities)
         text = describe.render("humanities", card, None, ctx.rng)
         if not text:
-            return None
+            self._text = None
+            return
         if card.get("category") == "人物":
             name = card.get("ref", {}).get("name", "")
             text += f"\n{name}。这名字你记下了。ask 能问出更多。"
-        return text
+        self._text = text
+
+    def render(self, ctx: WalkContext) -> str | None:
+        return getattr(self, "_text", None)
 
 
 class PersonAction:
@@ -158,7 +166,7 @@ class PersonAction:
     def should(self, ctx: WalkContext) -> bool:
         return not ctx.state.person_encountered_this_walk
 
-    def render(self, ctx: WalkContext) -> str | None:
+    def resolve(self, ctx: WalkContext) -> None:
         from nowhere import people as people_mod
 
         local_month = ctx.local_dt.month if ctx.local_dt else (ctx.now.month if ctx.now else 7)
@@ -166,13 +174,17 @@ class PersonAction:
             ctx.lat, ctx.lon, local_month, ctx.state.seen_people, ctx.rng,
         )
         if not hit:
-            return None
+            self._text = None
+            return
         ctx.state.person_encountered_this_walk = True
         ctx.state.last_person = hit["data"]
         ctx.state.last_person_place = hit["place"]
         ctx.state.talk_count = 0
         ctx.state.seen_people.add(f"{hit['place']}/{hit['person']}")
-        return hit["sight"]
+        self._text = hit["sight"]
+
+    def render(self, ctx: WalkContext) -> str | None:
+        return getattr(self, "_text", None)
 
 
 class MishapAction:
@@ -183,18 +195,21 @@ class MishapAction:
     def should(self, ctx: WalkContext) -> bool:
         return True
 
-    def render(self, ctx: WalkContext) -> str | None:
+    def resolve(self, ctx: WalkContext) -> None:
         from nowhere.server import _try_mishap
 
+        # 置位必须在 resolve(): 紧随其后的 MishapEchoAction.should() 读取
+        # 本字段, 若放在 render() 里则依赖隐式的注册表顺序 (见 WalkContext 注释)
         result = _try_mishap(ctx.env, ctx.rng)
-        if result:
-            ctx.mishap_fired = True
-            return result["text"]
-        return None
+        ctx.mishap_fired = result is not None
+        self._text = result["text"] if result else None
+
+    def render(self, ctx: WalkContext) -> str | None:
+        return getattr(self, "_text", None)
 
 
 class MishapEchoAction:
-    """意外回声: 50% chance next step echoes last mishap."""
+    """意外回声: 50% chance next step echoes last mishap (每个 mishap 仅回响一次)."""
 
     name = "mishap_echo"
 
@@ -238,7 +253,7 @@ class EncounterAction:
                 notebook_mod.record_with_env(
                     "fauna", fauna_name, ctx.state.place_name or "", nb_env, ctx.lat,
                 )
-        except Exception:
+        except (OSError, ValueError, TypeError):
             pass  # intentionally ignored: notebook recording is non-critical
         return enc
 
@@ -251,14 +266,20 @@ class MessageAction:
     def should(self, ctx: WalkContext) -> bool:
         return bool(ctx.state.messages) and ctx.rng.random() < 0.3 * ctx.encounter_multiplier
 
+    def resolve(self, ctx: WalkContext) -> None:
+        msg = ctx.rng.choice(list(ctx.state.messages))
+        if isinstance(msg, dict):
+            msg["encountered"] = True
+        self._msg = msg
+
     def render(self, ctx: WalkContext) -> str | None:
         from nowhere import describe
         from nowhere.server import _strip_code_markers
 
-        msg = ctx.rng.choice(list(ctx.state.messages))
+        msg = getattr(self, "_msg", None)
+        if msg is None:
+            return None
         content = msg["content"] if isinstance(msg, dict) else msg
-        if isinstance(msg, dict):
-            msg["encountered"] = True
         content = _strip_code_markers(str(content))
         return describe.render("message", {"content": content}, None, ctx.rng)
 
@@ -304,7 +325,7 @@ class BuriedItemAction:
     def should(self, ctx: WalkContext) -> bool:
         return bool(ctx.state.pos)
 
-    def render(self, ctx: WalkContext) -> str | None:
+    def resolve(self, ctx: WalkContext) -> None:
         from nowhere import placememory
         from nowhere.server import (
             _FIND_VARIANTS, _PUTBACK_VARIANTS, _sanitize_external,
@@ -312,7 +333,8 @@ class BuriedItemAction:
 
         nearby = placememory.buried_nearby(ctx.lat, ctx.lon, radius_km=3.0)
         if not nearby or ctx.rng.random() >= 0.08:
-            return None
+            self._text = None
+            return
         item = ctx.rng.choice(nearby)
         find_text = ctx.rng.choice(_FIND_VARIANTS)
         note_text = ""
@@ -324,8 +346,12 @@ class BuriedItemAction:
                 "from": item.get("from", "土里"),
                 "desc": item.get("desc", ""),
             }
-            return find_text + note_text
-        return find_text + note_text + ctx.rng.choice(_PUTBACK_VARIANTS)
+            self._text = find_text + note_text
+            return
+        self._text = find_text + note_text + ctx.rng.choice(_PUTBACK_VARIANTS)
+
+    def render(self, ctx: WalkContext) -> str | None:
+        return getattr(self, "_text", None)
 
 
 class NightNavAction:
@@ -362,7 +388,9 @@ class WildernessNarrativeAction:
 
         parts: list[str] = []
         wd = ctx.wilderness_depth
-        # Sparse narrative
+        # 本 Action 在 ACTIONS 队首执行, 此处 ctx.sections 只含管线注入的
+        # pre-action 内容(body/salience/dawn chorus); LocalScene 等后续 Action
+        # 产出的长段落不参与判断 —— 门控范围仅限已有叙事
         if wd > 30.0 and not any(len(s) > 10 for s in ctx.sections):
             parts.append("好久没见着人迹了。")
         # Wilderness variant (only if not too many sections)
@@ -404,7 +432,9 @@ class LocalSceneAction:
     def should(self, ctx: WalkContext) -> bool:
         return not ctx.is_deep_wilderness and not ctx.env_cached
 
-    def render(self, ctx: WalkContext) -> str | None:
+    def resolve(self, ctx: WalkContext) -> None:
+        # 本 Action 把成品段落直接追加进 ctx.sections(管线渲染入口),
+        # 因此没有 render 输出; 所有状态变更集中在这里, render() 保持无副作用
         from nowhere import (
             country as country_mod,
             describe,
@@ -421,12 +451,11 @@ class LocalSceneAction:
         sections = ctx.sections
 
         local_hour = None
-        cc = None
         tz_walk = _tf.timezone_at(lat=lat, lng=lon)
         if tz_walk and now is not None:
             local_hour = now.astimezone(ZoneInfo(tz_walk)).hour
         cc = country_mod.country_code_of(lat, lon)
-        ctx.had_local = False
+        had_local = False
 
         # 1. Localcolor card
         if place and len(sections) < 4:
@@ -441,7 +470,7 @@ class LocalSceneAction:
                 ctx.state.seen_cards.add(local_card["key"])
                 placememory.save_seen_cards(place, ctx.state.seen_cards)
                 sections.append(local_card["text"])
-                ctx.had_local = True
+                had_local = True
                 try:
                     if "/植被/" in local_card.get("key", ""):
                         flora = local_card["text"].split("。")[0].split(",")[0].split("，")[0].strip()
@@ -449,7 +478,7 @@ class LocalSceneAction:
                             nb_env = dict(ctx.env) if ctx.env else {}
                             nb_env["_dt"] = now
                             notebook_mod.record_with_env("flora", flora, place, nb_env, lat)
-                except Exception:
+                except (OSError, ValueError, TypeError):
                     pass  # intentionally ignored: notebook recording is non-critical
 
         # 1b. Trace (Card 16: blind时禁抽, traces contain place-specific details)
@@ -458,8 +487,7 @@ class LocalSceneAction:
             trace_text = placememory.get_trace_text(place)
             if trace_text and trace_text not in set(ctx.state.recent_scenes):
                 sections.append(trace_text)
-                ctx.state.recent_scenes.append(trace_text)
-                ctx.had_local = True
+                had_local = True
 
         # 1c. Festival hit (Card 16: blind时禁抽)
         if place and not _blind and len(sections) < 4:
@@ -467,38 +495,37 @@ class LocalSceneAction:
             fest_text = _check_festival_hit(place, cc, lat, now, ctx.rng)
             if fest_text and fest_text not in set(ctx.state.recent_scenes):
                 sections.append(fest_text)
-                ctx.state.recent_scenes.append(fest_text)
-                ctx.had_local = True
+                had_local = True
 
         # 2. Location-specific scenes
-        if not ctx.had_local and place and len(sections) < 4:
+        if not had_local and place and len(sections) < 4:
             location_scenes = describe._load_location_scenes()
             if place in location_scenes:
                 text = _pick_fresh(location_scenes[place], ctx.rng)
                 if text:
                     sections.append(text)
-                    ctx.had_local = True
+                    had_local = True
 
         # 3. Soundscape
-        if not ctx.had_local and place and len(sections) < 4:
+        if not had_local and place and len(sections) < 4:
             soundscapes = _load_scene_file("scene_soundscape")
             if place in soundscapes:
                 text = _pick_fresh(soundscapes[place], ctx.rng)
                 if text:
                     sections.append(text)
-                    ctx.had_local = True
+                    had_local = True
 
         # 4. Taste/smell
-        if not ctx.had_local and place and len(sections) < 4:
+        if not had_local and place and len(sections) < 4:
             tastes = _load_scene_file("scene_taste")
             if place in tastes:
                 text = _pick_fresh(tastes[place], ctx.rng)
                 if text:
                     sections.append(text)
-                    ctx.had_local = True
+                    had_local = True
 
         # 5. Generic biome fallback
-        if not ctx.had_local and len(sections) < 4:
+        if not had_local and len(sections) < 4:
             composed = describe._compose_walk_scene(
                 ctx.step_result.get("new_surface", ctx.env.get("surface", "grass")),
                 ctx.state.biome or "",
@@ -509,14 +536,15 @@ class LocalSceneAction:
             if composed:
                 sections.append(composed)
 
-        return None  # text already appended to ctx.sections
+    def render(self, ctx: WalkContext) -> str | None:
+        return None  # 文本已在 resolve() 中追加进 ctx.sections
 
 
 # ── Post-compose Actions (append to prose, not sections) ────────────
 
 
 class SouvenirAction:
-    """Natural souvenir pickup: 15% (25% first step)."""
+    """Natural souvenir pickup: 50% on first step, 30% afterwards."""
 
     name = "souvenir"
 
@@ -551,13 +579,16 @@ class FestivalChaseAction:
             and ctx.rng.random() < 0.10
         )
 
-    def render(self, ctx: WalkContext) -> str | None:
+    def resolve(self, ctx: WalkContext) -> None:
         from nowhere.server import _check_festival_chase
 
         text = _check_festival_chase(ctx.lat, ctx.lon, ctx.now)
         if text:
             ctx.state.errand_festival_mentioned_this_journey = True
-        return text
+        self._text = text
+
+    def render(self, ctx: WalkContext) -> str | None:
+        return getattr(self, "_text", None)
 
 
 class CotravelerAction:
@@ -573,7 +604,8 @@ class CotravelerAction:
             and not travelers_mod.walk_alone_active(ctx.state)
         )
 
-    def render(self, ctx: WalkContext) -> str | None:
+    def resolve(self, ctx: WalkContext) -> None:
+        import logging
         import os
         from nowhere import travelers as travelers_mod
 
@@ -581,27 +613,39 @@ class CotravelerAction:
         lat, lon = ctx.lat, ctx.lon
         prose_parts: list[str] = []
 
-        # Refresh pos every 5 steps
-        if ctx.state.walk_step_counter % 5 == 0:
-            travelers_mod.refresh_pos(traveler_name, lat, lon)
-        # Record footprint
-        travelers_mod.record_footprint(traveler_name, lat, lon, ctx.state.place_name or "")
-        # Check other travelers' footprints
-        from nowhere.server import _cotraveler_encounter_counts, _cotraveler_meeting_log
+        try:
+            # Refresh pos every 5 steps
+            if ctx.state.walk_step_counter % 5 == 0:
+                travelers_mod.refresh_pos(traveler_name, lat, lon)
+            # Record footprint
+            travelers_mod.record_footprint(traveler_name, lat, lon, ctx.state.place_name or "")
+            # Check other travelers' footprints
+            from nowhere.server import _cotraveler_encounter_counts, _cotraveler_meeting_log
 
-        fp_text = travelers_mod.check_footprints(
-            traveler_name, lat, lon, ctx.rng, _cotraveler_encounter_counts,
-        )
-        if fp_text:
-            prose_parts.append(fp_text)
-        # Check meeting (full mode only)
-        if not travelers_mod.is_quiet():
-            my_meet, _their_meet = travelers_mod.check_meeting(
-                traveler_name, lat, lon, ctx.rng, _cotraveler_meeting_log,
+            fp_text = travelers_mod.check_footprints(
+                traveler_name, lat, lon, ctx.rng, _cotraveler_encounter_counts,
             )
-            if my_meet:
-                prose_parts.append(my_meet)
-        return "\n".join(prose_parts) if prose_parts else None
+            if fp_text:
+                prose_parts.append(fp_text)
+            # Check meeting (full mode only)
+            if not travelers_mod.is_quiet():
+                my_meet, _their_meet = travelers_mod.check_meeting(
+                    traveler_name, lat, lon, ctx.rng, _cotraveler_meeting_log,
+                )
+                if my_meet:
+                    prose_parts.append(my_meet)
+        except (OSError, ValueError) as exc:
+            # 同游者文件损坏/读失败已按 P0-31 语义改为抛错;
+            # 这里兜住, 不让非核心功能炸掉行走管线
+            logging.getLogger(__name__).warning(
+                "cotraveler step skipped: %s", exc,
+            )
+            self._text = None
+            return
+        self._text = "\n".join(prose_parts) if prose_parts else None
+
+    def render(self, ctx: WalkContext) -> str | None:
+        return getattr(self, "_text", None)
 
 
 # ── Registries ──────────────────────────────────────────────────────
@@ -611,7 +655,7 @@ ACTIONS: list[Action] = [
     WildernessNarrativeAction(),  # 荒深档叙事 (gated by is_deep_wilderness)
     LocalSceneAction(),           # 城市特有 > 通用 biome
     RadioQuietAction(),           # Card 39: 冷却期设计过的安静
-    RhythmAction(),               # 节日/纪念日 (highest priority)
+    RhythmAction(),               # 节日/纪念日 (先于时间轴, 非 最高优先级)
     TimeaxisAction(),             # 时间轴
     HumanitiesAction(),           # 人文卡
     PersonAction(),               # 卡中人遇见

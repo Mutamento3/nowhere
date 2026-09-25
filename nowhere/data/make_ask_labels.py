@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 import json
+import pathlib
 from collections import Counter
 
-INPUT = "ask_kb.json"
-OUTPUT = "ask_labels.json"
+# 数据目录锚定脚本自身: 以 cwd 相对路径运行时会把 ask_labels.json 写到
+# 错误目录(或直接 FileNotFoundError)
+_DATA_DIR = pathlib.Path(__file__).resolve().parent
+INPUT = _DATA_DIR / "ask_kb.json"
+OUTPUT = _DATA_DIR / "ask_labels.json"
+STATS = _DATA_DIR / "_tag_stats.txt"
 
 # Tag keyword rules - check against key + value combined
 RULES = {
@@ -12,14 +17,14 @@ RULES = {
         "教堂", "宫殿", "遗址", "遗迹", "废墟", "纪念碑", "雕像", "铁塔", "歌剧院",
         "博物馆", "美术馆", "公园", "花园", "牌坊", "古迹", "天坛", "故宫", "长城",
         "泰姬陵", "金字塔", "斗兽场", "比萨斜塔", "自由女神", "凯旋门", "卢浮宫",
-        "凡尔赛", "白金汉", "圣殿", "集中营", "纪念堂", "金融中心", "101",
+        "凡尔赛", "白金汉", "圣殿", "集中营", "纪念堂", "金融中心",
         "好莱坞", "大道", "墙", "角", "宫", "人民宫", "之路", "墓地", "大坝", "大三巴",
         "勃兰登堡",
     ],
     "地名": [
         "城", "市", "镇", "村", "区", "县", "省", "州", "邦", "府", "都", "京", "港",
         "岸", "码头", "机场", "车站", "半岛", "群岛", "海峡", "运河", "首都", "首府",
-        "位于", "地处", "坐落", "坐落于",
+        "地处", "坐落于",
     ],
     "人物": [
         "先生", "女士", "皇帝", "国王", "王后", "王子", "将军", "大臣", "圣", "师",
@@ -120,7 +125,7 @@ RULES = {
         "语", "话", "文",
     ],
     "建筑": [
-        "建筑", "式", "风格", "主义", "构造", "结构", "设计", "规划", "布局",
+        "建筑", "风格", "构造", "结构", "设计", "规划", "布局",
         "隧道", "地铁站", "道观", "瓦",
     ],
     "服装": [
@@ -179,21 +184,35 @@ RULES = {
 }
 
 
+# 单字关键词(美/文/写/家/师…)只对 key 匹配: 它们对 value 全文的子串
+# 匹配是系统性误标源("9·11事件"因"美国"被标艺术等)。构造期保序去重,
+# 汗国/诗人/河 等重复条目只保留首个
+_SINGLE_KW: dict[str, tuple] = {}
+_MULTI_KW: dict[str, tuple] = {}
+for _tag, _kws in RULES.items():
+    _kws = tuple(dict.fromkeys(_kws))
+    _SINGLE_KW[_tag] = tuple(k for k in _kws if len(k) == 1)
+    _MULTI_KW[_tag] = tuple(k for k in _kws if len(k) >= 2)
+
+
 def tag_entry(key: str, value: str) -> list[str]:
     """Return list of tags for a given entry key + value."""
-    text = key + value
     tags = []
-    for tag_name, keywords in RULES.items():
-        for kw in keywords:
-            if kw in text:
-                tags.append(tag_name)
-                break
+    for tag_name in RULES:
+        if any(kw in key for kw in _SINGLE_KW[tag_name]):
+            tags.append(tag_name)
+            continue
+        if any(kw in key + value for kw in _MULTI_KW[tag_name]):
+            tags.append(tag_name)
     return tags if tags else ["杂物"]
 
 
 def main():
-    with open(INPUT, "r", encoding="utf-8") as f:
-        kb = json.load(f)
+    try:
+        with open(INPUT, "r", encoding="utf-8") as f:
+            kb = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"读取 {INPUT} 失败: {exc}")
 
     labels = {}
     for key, value in kb.items():
@@ -203,7 +222,7 @@ def main():
         json.dump(labels, f, ensure_ascii=False, indent=2)
 
     # Write stats
-    with open("_tag_stats.txt", "w", encoding="utf-8") as out:
+    with open(STATS, "w", encoding="utf-8") as out:
         out.write(f"Total entries: {len(labels)}\n\n")
 
         counter = Counter()

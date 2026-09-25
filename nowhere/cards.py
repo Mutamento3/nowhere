@@ -141,6 +141,8 @@ def load_humanities(data_dir: pathlib.Path | None = None) -> list[Card]:
     main_file = d / "humanities.json"
     raw = json.loads(main_file.read_text("utf-8")) if main_file.exists() else {}
     places: dict = raw.get("places", {})
+    if not isinstance(places, dict):
+        places = {}
 
     regional_files = [
         "humanities_films.json",
@@ -152,16 +154,28 @@ def load_humanities(data_dir: pathlib.Path | None = None) -> list[Card]:
             continue
         regional = json.loads(p.read_text("utf-8"))
         entries = regional.get("places", regional) if isinstance(regional, dict) else regional
+        if not isinstance(entries, dict):
+            continue
         for k, v in entries.items():
-            if k.startswith("_"):
+            if not isinstance(k, str) or k.startswith("_"):
+                continue
+            if not isinstance(v, dict):
                 continue
             if k not in places:
                 places[k] = v
 
     cards: list[Card] = []
     for place, entry in places.items():
+        if not isinstance(entry, dict):
+            continue
         for cat in ("事件", "人物", "作品"):
-            for i, card_data in enumerate(entry.get(cat, [])):
+            cat_values = entry.get(cat, [])
+            if not isinstance(cat_values, list):
+                continue
+            for i, card_data in enumerate(cat_values):
+                # 外部数据源, 非法条目跳过而不是让整次加载失败
+                if not isinstance(card_data, dict):
+                    continue
                 cid = f"{place}/{cat}/{i}"
                 meta: dict[str, Any] = {"category": cat}
                 # Carry over all non-text fields as meta (name, year, title, creator, ...)
@@ -294,30 +308,49 @@ def matches_conditions(card: Card, ctx: dict) -> bool:
     if place and ctx.get("place") and place != ctx["place"]:
         return False
 
-    # Biome filter
+    # Biome filter (supports "grass" or ["grass", "forest"])
     biome = cond.get("biome")
     if biome and ctx.get("biome"):
-        ctx_biome = ctx["biome"].lower()
-        if isinstance(biome, str) and biome.lower() != ctx_biome:
+        ctx_biome = str(ctx["biome"]).lower()
+        biomes = biome if isinstance(biome, (list, tuple, set)) else [biome]
+        if not any(str(b).lower() == ctx_biome for b in biomes):
             return False
 
-    # Hours filter: cond["hours"] = [start, end) range
+    # Hours filter: cond["hours"] = [start, end) range.
+    # 形状非法(标量/长度不足)视为不匹配跳过该卡, 不让单条畸形数据炸掉整次抽取
     hours = cond.get("hours")
     if hours and ctx.get("hours") is not None:
         h = ctx["hours"]
-        if not (hours[0] <= h < hours[1]):
+        if (isinstance(hours, (list, tuple)) and len(hours) >= 2
+                and all(isinstance(b, (int, float)) for b in hours[:2])):
+            if not (hours[0] <= h < hours[1]):
+                return False
+        else:
             return False
 
     # Month filter: cond["months"] = list of valid months
     months = cond.get("months")
     if months and ctx.get("month") is not None:
-        if ctx["month"] not in months:
+        if isinstance(months, (list, tuple, set)):
+            if ctx["month"] not in months:
+                return False
+        else:
             return False
 
     # Weekday filter: cond["weekday"] = list of valid weekdays (0=Mon, 6=Sun)
     weekday = cond.get("weekday")
     if weekday is not None and ctx.get("weekday") is not None:
-        if ctx["weekday"] not in weekday:
+        if isinstance(weekday, (list, tuple, set)):
+            if ctx["weekday"] not in weekday:
+                return False
+        else:
+            return False
+
+    # Season filter: cond["season"] = season name or list ("spring" ...)
+    season = cond.get("season")
+    if season and ctx.get("season"):
+        seasons = season if isinstance(season, (list, tuple, set)) else [season]
+        if str(ctx["season"]).lower() not in [str(s).lower() for s in seasons]:
             return False
 
     # Region filter (for encounters)
@@ -360,7 +393,13 @@ def select(
         if not matches_conditions(card, ctx):
             continue
         w = card.meta.get("weight", 1.0)
-        eligible.append((card, w))
+        try:
+            w_f = float(w)
+        except (TypeError, ValueError):
+            continue
+        if not w_f > 0:  # 0/负权重意为禁用, NaN 同样不可抽
+            continue
+        eligible.append((card, w_f))
 
     if not eligible:
         return []
@@ -380,6 +419,8 @@ def select(
     remaining = list(eligible)
     for _ in range(min(k, len(remaining))):
         total = sum(w for _, w in remaining)
+        if total <= 0:
+            break
         r = rng.uniform(0, total)
         for idx, (card, w) in enumerate(remaining):
             r -= w

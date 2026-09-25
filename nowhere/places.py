@@ -10,6 +10,7 @@ import json
 import math
 import pathlib
 import sqlite3
+import threading
 
 _DATA = pathlib.Path(__file__).resolve().parent / "data"
 
@@ -31,6 +32,7 @@ def _resolve_db() -> pathlib.Path:
 _DB = _resolve_db()
 _PATCH = _DATA / "places_patch.json"
 _PATCH_CACHE: dict | None = None
+_PATCH_LOWER_CACHE: dict[str, dict] | None = None
 
 _TYPE_ZH: dict[str, str] = {
     "MT": "山", "MTS": "山脉", "PK": "峰", "HLL": "丘", "VAL": "谷",
@@ -62,14 +64,19 @@ def _bearing_deg(a_lat, a_lon, b_lat, b_lon) -> float:
 
 
 _conn_instance: sqlite3.Connection | None = None
+_conn_lock = threading.Lock()
 
 
 def _conn() -> sqlite3.Connection | None:
     global _conn_instance
     if _conn_instance is None:
-        if not _DB.exists():
-            return None
-        _conn_instance = sqlite3.connect(_DB)
+        with _conn_lock:
+            if _conn_instance is None:
+                if not _DB.exists():
+                    return None
+                # server 有后台线程与线程池并发查询; sqlite3 自身可串行化,
+                # 但默认 check_same_thread=True 会直接抛 ProgrammingError
+                _conn_instance = sqlite3.connect(_DB, check_same_thread=False)
     return _conn_instance
 
 
@@ -82,6 +89,14 @@ def _patch() -> dict:
         return _PATCH_CACHE
     _PATCH_CACHE = {}
     return _PATCH_CACHE
+
+
+def _patch_lower() -> dict[str, dict]:
+    """补丁的小写索引, 随加载构建一次缓存(每次查询重建是 O(n) 重复开销)。"""
+    global _PATCH_LOWER_CACHE
+    if _PATCH_LOWER_CACHE is None:
+        _PATCH_LOWER_CACHE = {k.lower(): v for k, v in _patch().items()}
+    return _PATCH_LOWER_CACHE
 
 
 def _row_to_dict(row, from_lat, from_lon) -> dict:
@@ -107,18 +122,43 @@ _LANDMARK_S = {
 
 def nearby(lat: float, lon: float, radius_km: float = 20.0, limit: int = 10) -> list[dict]:
     """附近的命名地点,按距离排(滤掉商业 POI 噪声)。"""
-    conn = _conn()
+    try:
+        conn = _conn()
+    except sqlite3.Error:
+        return []  # 库文件不可读等连接期失败,降级不炸
     if conn is None:
         return []
+    deg = radius_km / 111.0
+    lat_delta = deg
+    # 经度一度的实地距离是 111*cos(lat), 中高纬用同一半宽会漏掉正东/西的近点
+    cos_lat = max(math.cos(math.radians(lat)), 1e-6)
+    lon_delta = min(deg / cos_lat, 180.0)
+    lat_min = max(lat - lat_delta, -90.0)
+    lat_max = min(lat + lat_delta, 90.0)
+    # 换日线附近拆成两个区间; 不跨线时第二区间用恒假占位
+    if lon - lon_delta < -180.0:
+        lo1, hi1 = -180.0, lon + lon_delta
+        lo2, hi2 = lon - lon_delta + 360.0, 180.0
+    elif lon + lon_delta > 180.0:
+        lo1, hi1 = lon - lon_delta, 180.0
+        lo2, hi2 = -180.0, lon + lon_delta - 360.0
+    else:
+        lo1, hi1 = lon - lon_delta, lon + lon_delta
+        lo2, hi2 = 0.0, -1.0
     try:
-        deg = radius_km / 111.0
+        # 排序下推到 SQL: LIMIT 截断发生在 Python 侧精排之前, 无 ORDER BY
+        # 时截哪批全由扫描顺序决定, 最近点可能整批被丢
         rows = conn.execute(
             """SELECT id, name, lat, lon, fclass, fcode FROM places
-               WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?
-               AND fclass IN ('S','T','H','V','P') LIMIT 3000""",
-            (lat - deg, lat + deg, lon - deg, lon + deg),
+               WHERE lat BETWEEN ? AND ?
+               AND (lon BETWEEN ? AND ? OR lon BETWEEN ? AND ?)
+               AND fclass IN ('S','T','H','V','P')
+               ORDER BY (lat - ?) * (lat - ?)
+                        + ((lon - ?) * ?) * ((lon - ?) * ?)
+               LIMIT 3000""",
+            (lat_min, lat_max, lo1, hi1, lo2, hi2, lat, lat, lon, cos_lat, lon, cos_lat),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.Error:
         rows = []  # places.db 为空/损坏,降级不炸
     out = []
     for row in rows:
@@ -204,14 +244,17 @@ def _contextual_match(name: str, near: tuple[float, float]) -> dict | None:
 
 def _patch_lookup(name: str, near: tuple[float, float] | None) -> dict | None:
     patch = _patch()
-    patch_lower = {k.lower(): v for k, v in patch.items()}
-    hit = patch.get(name) or patch_lower.get(name.lower())
-    if not hit:
+    hit = patch.get(name) or _patch_lower().get(name.lower())
+    if not isinstance(hit, dict):
         return None
-    result = {"name": name, "lat": hit["lat"], "lon": hit["lon"], "type": hit.get("type", "地标")}
+    lat, lon = hit.get("lat"), hit.get("lon")
+    # 手工维护的补丁缺 lat/lon 时跳过该条目, 而不是让 find 抛 KeyError
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        return None
+    result = {"name": name, "lat": float(lat), "lon": float(lon), "type": hit.get("type", "地标")}
     if near:
-        result["distance_km"] = round(_haversine_km(near[0], near[1], hit["lat"], hit["lon"]), 1)
-        result["bearing"] = _bearing_word(_bearing_deg(near[0], near[1], hit["lat"], hit["lon"]))
+        result["distance_km"] = round(_haversine_km(near[0], near[1], float(lat), float(lon)), 1)
+        result["bearing"] = _bearing_word(_bearing_deg(near[0], near[1], float(lat), float(lon)))
     return result
 
 
@@ -225,10 +268,10 @@ def _fts_lookup(name: str, near: tuple[float, float] | None) -> dict | None:
             """SELECT p.id, p.name, p.ascii, p.lat, p.lon, p.fclass, p.fcode, p.pop
                FROM places_fts f JOIN places p ON p.id = f.rowid
                WHERE places_fts MATCH ? LIMIT 20""",
-            (f'"{name}"',),
+            (f'"{name.replace(chr(34), chr(34) * 2)}"',),
         ).fetchall()
-    except sqlite3.OperationalError:
-        rows = []  # 库还在建(FTS 未就绪),降级不炸
+    except sqlite3.Error:
+        rows = []  # 库还在建(FTS 未就绪)或 MATCH 语法异常,降级不炸
     if not rows:
         return None
 

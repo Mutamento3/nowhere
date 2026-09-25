@@ -45,10 +45,12 @@ def _load_notebook() -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        # ERR-05: a corrupt file must be preserved — the next save would
-        # otherwise overwrite it with {} and silently destroy the data.
+        data = None
+    if not isinstance(data, dict):
+        # ERR-05: 合法但非对象的 JSON(list/str/数字)同样按损坏处理 ——
+        # 直接返回会被下一次 _save_notebook 静默覆盖为 {}, 数据不可恢复
         backup = p.with_name(p.name + ".corrupt")
         n = 0
         while backup.exists():
@@ -59,6 +61,7 @@ def _load_notebook() -> dict:
         except OSError:
             pass  # intentionally ignored: backup failure, still return empty
         return {}
+    return data
 
 
 def _save_notebook(data: dict) -> None:
@@ -67,14 +70,22 @@ def _save_notebook(data: dict) -> None:
     payload = json.dumps(data, ensure_ascii=False, indent=1)
     fd, tmp_name = tempfile.mkstemp(prefix="notebook-", suffix=".tmp", dir=str(p.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+        try:
+            tmp = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)  # fdopen 失败时 fd 未移交 with, 显式关闭防泄漏
+            raise
+        with tmp:
             tmp.write(payload)
             tmp.flush()
             os.fsync(tmp.fileno())
         os.replace(tmp_name, str(p))
-    except OSError:
-        if os.path.exists(tmp_name):
+    except BaseException:
+        # 清理自身不许抛(遮蔽原始异常); 非 OSError(如 UnicodeEncodeError)也别留残留
+        try:
             os.unlink(tmp_name)
+        except OSError:
+            pass
         raise
 
 
@@ -299,7 +310,9 @@ def _generate_first_impression(
     try:
         return template.format(name, w_word, t_word, a_word)
     except (IndexError, KeyError):
-        return template.format(name, w_word, t_word, a_word)
+        # 同参数原样重试必然复现异常; 降级为不依赖占位符的文本并留日志
+        logger.warning("first impression template failed for %s/%s", volume, name)
+        return f"{name}。"
 
 
 # ── 核心记录函数 ─────────────────────────────────────────────────────
@@ -310,6 +323,8 @@ def record(
     place: str,
     first_impression: str | None = None,
     sim_time: datetime | None = None,
+    lat: float | None = None,
+    lon: float | None = None,
 ) -> None:
     """记一笔到指定册。FIFO 上限 200,"只有一次的"永不丢。"""
     if volume not in VOLUMES:
@@ -324,6 +339,9 @@ def record(
         "at": now_iso,
         "sim_time": sim_time.isoformat() if sim_time is not None else None,
         "first_impression": first_impression,
+        # 渲染层算季节要用当场坐标; 老条目没有这两个键, 渲染侧回退 30N
+        "lat": lat,
+        "lon": lon,
     }
 
     data = _load_notebook()
@@ -337,9 +355,14 @@ def record(
     # FIFO: 超限时从最旧的开始丢
     # 唯一条目(count=1)搬进 uniques 永不丢,非唯一直接丢
     while len(vol_list) > _VOLUME_CAP:
-        # 统计当前列表中每个 name 的出现次数
+        # 统计每个 name 的出现次数: 必须合并 uniques 里已永久保留的同名
+        # 条目, 否则 X 进过 uniques 后再记一次, 溢出时会被再次判"唯一",
+        # uniques 重复增长且"只有一次"语义被破坏
         name_counts: dict[str, int] = {}
         for e in vol_list:
+            n = e.get("name", "")
+            name_counts[n] = name_counts.get(n, 0) + 1
+        for e in vol_uniques:
             n = e.get("name", "")
             name_counts[n] = name_counts.get(n, 0) + 1
 
@@ -369,7 +392,11 @@ def record_with_env(
     """记录一笔,自动生成 first_impression。"""
     fi = _generate_first_impression(volume, name, env, lat, lon)
     _dt = (env or {}).get("_dt") if env else None
-    record(volume, name, place, fi, sim_time=_dt if isinstance(_dt, datetime) else None)
+    record(
+        volume, name, place, fi,
+        sim_time=_dt if isinstance(_dt, datetime) else None,
+        lat=lat, lon=lon,
+    )
 
 
 # ── 查询函数 ─────────────────────────────────────────────────────────
@@ -448,19 +475,12 @@ def _render_overview() -> str:
             parts.append(rng.choice(empty_variants))
             continue
 
-        # 第一笔
-        first = main_list[0] if main_list else (unique_list[0] if unique_list else None)
+        # 第一笔: FIFO 从主列表队首淘汰, 进过 uniques 的条目必然比
+        # 主列表现存所有条目更早, 全册最早的一笔在 unique_list[0]
+        first = unique_list[0] if unique_list else (main_list[0] if main_list else None)
         first_name = first.get("name", "") if first else ""
         first_place = first.get("place", "") if first else ""
-        first_at = first.get("at", "") if first else ""
-        first_season = ""
-        if first_at:
-            try:
-                dt = datetime.fromisoformat(first_at)
-                lat = 30.0  # TODO: pass actual lat from caller; default is ~mid-latitude China
-                first_season = _compute_season(dt.month, lat)
-            except Exception:
-                pass  # intentionally ignored: datetime parse failure, season left blank
+        first_season = _entry_season(first) if first else ""
 
         # 最近一笔
         last = main_list[-1] if main_list else None
@@ -497,61 +517,61 @@ def _render_volume(volume: str) -> str:
 
     # 主列表
     for entry in main_list:
-        name = entry.get("name", "")
-        place = entry.get("place", "")
-        at = entry.get("at", "")
-        fi = entry.get("first_impression")
-
-        season = ""
-        if at:
-            try:
-                dt = datetime.fromisoformat(at)
-                season = _compute_season(dt.month, 30.0)
-            except Exception:
-                pass  # intentionally ignored: datetime parse failure, season left blank
-
-        # 第一行: "云莓——拉普兰,夏天"
-        parts = [name]
-        if place and season:
-            parts.append(f"{place},{season}")
-        elif place:
-            parts.append(place)
-        elif season:
-            parts.append(season)
-        lines.append("——".join(parts) if len(parts) > 1 else name)
-
-        # 第二行: 缩进初见印象
-        if fi:
-            lines.append(f"  {fi}")
+        lines.extend(_format_entry(entry))
 
     # 唯一保留条目(被 FIFO 丢掉但 count=1 的)
     if unique_list:
         lines.append("")
         lines.append("——曾经记下又翻过去的一页——")
         for entry in unique_list:
-            name = entry.get("name", "")
-            place = entry.get("place", "")
-            at = entry.get("at", "")
-            fi = entry.get("first_impression")
-
-            season = ""
-            if at:
-                try:
-                    dt = datetime.fromisoformat(at)
-                    season = _compute_season(dt.month, 30.0)
-                except Exception:
-                    pass  # intentionally ignored: datetime parse failure, season left blank
-
-            parts = [name]
-            if place and season:
-                parts.append(f"{place},{season}")
-            elif place:
-                parts.append(place)
-            lines.append("——".join(parts) if len(parts) > 1 else name)
-            if fi:
-                lines.append(f"  {fi}")
+            lines.extend(_format_entry(entry))
 
     return "\n".join(lines)
+
+
+def _entry_season(entry: dict) -> str:
+    """条目季节: 优先用持久化的 lat/lon 转本地月份再算(南半球翻转可达);
+    老条目没有坐标时回退 30N/UTC 月。"""
+    at = entry.get("at", "")
+    if not at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(at)
+    except (ValueError, TypeError):
+        return ""
+    lat = entry.get("lat")
+    lon = entry.get("lon")
+    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+        try:
+            from timezonefinder import TimezoneFinder
+            from zoneinfo import ZoneInfo
+            tz_name = TimezoneFinder().timezone_at(lat=float(lat), lng=float(lon))
+            if tz_name:
+                dt = dt.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            pass  # intentionally ignored: tz lookup failure, falls back to UTC month
+        return _compute_season(dt.month, float(lat))
+    return _compute_season(dt.month, 30.0)
+
+
+def _format_entry(entry: dict) -> list[str]:
+    """单条目渲染(主列表与 uniques 共用, 防两分支漂移)。"""
+    name = entry.get("name", "")
+    place = entry.get("place", "")
+    season = _entry_season(entry)
+
+    parts = [name]
+    if place and season:
+        parts.append(f"{place},{season}")
+    elif place:
+        parts.append(place)
+    elif season:
+        parts.append(season)
+    lines = ["——".join(parts) if len(parts) > 1 else name]
+    fi = entry.get("first_impression")
+    if fi:
+        lines.append(f"  {fi}")
+    return lines
 
 
 def notebook_unique_section() -> str:
@@ -561,13 +581,18 @@ def notebook_unique_section() -> str:
 
     for v in VOLUMES:
         main_list, unique_list = all_data[v]
-        # 统计主列表中每个 name 的出现次数
+        # 计数必须合并 uniques: 只在 uniques 里出现过的名字并非"只遇到过
+        # 一次"(它被搬进 uniques 恰恰说明只遇过一次, 但之后主列表再出现
+        # 同名时, 主列表计数为 1 会误判成唯一) —— 两处相加才是真实次数
         name_counts: dict[str, int] = {}
         for e in main_list:
             n = e.get("name", "")
             name_counts[n] = name_counts.get(n, 0) + 1
+        for e in unique_list:
+            n = e.get("name", "")
+            name_counts[n] = name_counts.get(n, 0) + 1
 
-        # 主列表中 count=1 的
+        # 主列表中真实 count=1 的
         for e in main_list:
             if name_counts.get(e.get("name", ""), 0) == 1:
                 fi = e.get("first_impression")

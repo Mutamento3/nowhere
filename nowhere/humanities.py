@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import pathlib
 import random
-import sys
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +48,11 @@ def _load() -> dict:
     _raw = json.loads(_DATA.read_text(encoding="utf-8")) if _DATA.exists() else {}
     _places = _raw.get("places", {})
     _aliases = _raw.get("aliases", {})
+    if not isinstance(_places, dict):
+        _places = {}
+    if not isinstance(_aliases, dict):
+        _aliases = {}
     main_count = len(_places)
-
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass  # intentionally ignored: stdout reconfigure may fail on some terminals
     logger.debug("[humanities] main: %d places", main_count)
 
     for fname in _REGIONAL_FILES:
@@ -70,8 +67,10 @@ def _load() -> dict:
             entries = regional
         added = 0
         for k, v in entries.items():
-            if k.startswith("_"):
+            if not isinstance(k, str) or k.startswith("_"):
                 continue  # skip metadata keys like _说明
+            if not isinstance(v, dict):
+                continue  # 非 dict 条目(注释/错行)跳过, 消费端 .get 会炸
             if k not in _places:
                 _places[k] = v
                 added += 1
@@ -83,7 +82,7 @@ def _load() -> dict:
             continue
         for _cat in ("事件",):
             for _card in _pentry.get(_cat, []):
-                if _card.get("name") in _HEAVY_EVENT_NAMES:
+                if isinstance(_card, dict) and _card.get("name") in _HEAVY_EVENT_NAMES:
                     _pentry["weight"] = "heavy"
                     break
             if _pentry.get("weight") == "heavy":
@@ -98,7 +97,9 @@ def is_heavy_place(place_name: str | None) -> bool:
     if not place_name:
         return False
     _load()
-    entry = _places.get(place_name)
+    # 别名解析与 has_place/draw 同契约: 外部传入的可能是别名
+    name = _resolve(place_name)
+    entry = _places.get(name) if name else None
     if not entry:
         return False
     return entry.get("weight") == "heavy"
@@ -109,7 +110,8 @@ def get_place_weight(place_name: str | None) -> str:
     if not place_name:
         return "normal"
     _load()
-    entry = _places.get(place_name)
+    name = _resolve(place_name)
+    entry = _places.get(name) if name else None
     if not entry:
         return "normal"
     return entry.get("weight", "normal")
@@ -221,10 +223,14 @@ def nearby_place(
     # 目的地解析
     dest_resolved = _resolve(destination) if destination else None
 
-    # 只留有未见卡的
+    # 只留有未见卡的 — 筛选口径与 draw 一致(仅事件/人物/作品三类),
+    # 数据中名为 category 的字段会覆盖解析器写入的分类, 不对齐会出现
+    # _has_unseen 为 True 而 draw 全 None 的静默失效
     def _has_unseen(name: str) -> bool:
         return any(
-            c.conditions.get("place") == name and c.id not in seen
+            c.conditions.get("place") == name
+            and c.meta.get("category") in ("事件", "人物", "作品")
+            and c.id not in seen
             for c in _get_cards()
         )
 
@@ -238,8 +244,13 @@ def nearby_place(
         x[1],
     ))
 
-    place_name = candidates[0][0]
-    card = draw(place_name, seen, rng)
+    # 逐个候选尝试抽卡, 第一处抽空不整体放弃(附近可能还有别处有卡)
+    card = None
+    place_name = None
+    for place_name, _dist in candidates:
+        card = draw(place_name, seen, rng)
+        if card is not None:
+            break
     if card is None:
         return None
     return {

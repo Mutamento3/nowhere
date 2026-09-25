@@ -69,7 +69,7 @@ def _load() -> dict[str, list[str]]:
     return _POOL
 
 
-def _region_for(biome: str, lat: float, lon: float) -> str:
+def _region_for(lat: float, lon: float) -> str:
     """Return the region tag for a given position.
 
     Priority (same geographic logic as before):
@@ -79,6 +79,8 @@ def _region_for(biome: str, lat: float, lon: float) -> str:
       4. americas -- roughly -55..70, -170..-30
       5. europe  -- roughly 35..72 N, -15..40 E
       6. natural -- default for land without strong region signal
+
+    (biome 形参已移除: 区域判定从来只看 lat/lon, 保留它会误导调用方)
     """
     if lat > 60 or lat < -60:
         return "polar"
@@ -116,13 +118,15 @@ def draw_encounter(
     5. Return a random choice with the ``[tag]`` prefix stripped.
     """
     pools = _load()
-    region = _region_for(biome, lat, lon)
+    region = _region_for(lat, lon)
 
     # Start with the geographic region pool.
     candidates: list[str] = list(pools.get(region, []))
 
-    # Mix in "natural" encounters (wilderness flavour).
-    candidates.extend(pools.get("natural", []))
+    # Mix in "natural" encounters (wilderness flavour), 不与自己重复:
+    # region 为 natural 时已是同一池, extend 一次会让权重翻倍
+    if region != "natural":
+        candidates.extend(pools.get("natural", []))
 
     # Mix in "art" encounters for urban / human-settlement biomes.
     biome_lower = biome.lower()
@@ -134,7 +138,9 @@ def draw_encounter(
     filtered = []
     for candidate in candidates:
         city = next((name for name in _CITY_PREFIXES if candidate.startswith(name)), None)
-        if city is None or not place_name or city in place_name or place_name in city:
+        # 未传地名=不知道在哪 → 城市限定条目应视为"非该城市"丢弃;
+        # 反向子串已去掉: "金山" in "旧金山" 会误放行旧金山的专属场景
+        if city is None or (place_name and city in place_name):
             filtered.append(candidate)
     candidates = filtered
 

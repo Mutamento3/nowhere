@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import json
-import math
 import pathlib
 import random
 from datetime import datetime, timezone
@@ -36,8 +35,8 @@ def _load_letters() -> list[dict]:
 
 def pick_letter(
     rng: random.Random,
-    listener_lat: float = 0.0,
-    listener_lon: float = 0.0,
+    listener_lat: float | None = None,
+    listener_lon: float | None = None,
 ) -> dict | None:
     """Pick a random letter from the pool. Returns letter dict or None.
 
@@ -48,8 +47,9 @@ def pick_letter(
     pool = _load_letters()
     if not pool:
         return None
-    # Distance filter
-    if listener_lat != 0.0 or listener_lon != 0.0:
+    # Distance filter.  哨兵改用 None: (0,0) 是几内亚湾的真实坐标,
+    # 那里的听者不该被跳过全部距离过滤
+    if listener_lat is not None or listener_lon is not None:
         near_pool = []
         for letter in pool:
             dlat = letter.get("dest_lat")
@@ -68,10 +68,12 @@ def take_letter(letter: dict, sim_time: datetime) -> dict:
     """Package a letter into an errand dict for state.errand."""
     return {
         "kind": "letter",
-        "sender": letter["sender"],
-        "recipient_desc": letter["recipient"],
-        "hint": letter["hint"],
-        "text": letter["text"],
+        # 与下方 dest_lat/dest_lon 的 .get() 口径一致, 单条坏数据
+        # 不该让取信流程整体 KeyError
+        "sender": letter.get("sender", ""),
+        "recipient_desc": letter.get("recipient", ""),
+        "hint": letter.get("hint", ""),
+        "text": letter.get("text", ""),
         "taken_at": sim_time.isoformat(),
         "dest_lat": letter.get("dest_lat"),
         "dest_lon": letter.get("dest_lon"),

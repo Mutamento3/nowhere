@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import pathlib
 import random
-import sys
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +37,6 @@ def _load() -> dict:
     global _data
     if _data is not None:
         return _data
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass  # intentionally ignored: stdout reconfigure may fail on some terminals
     if not _SEED_FILE.exists():
         logger.debug("[people] seed file missing")
         _data = {}
@@ -77,10 +71,11 @@ def _load_place_coords() -> dict[str, tuple[float, float]]:
         try:
             h = json.loads(h_path.read_text(encoding="utf-8"))
             for name, entry in h.get("places", {}).items():
-                if "lat" in entry and "lon" in entry:
+                if isinstance(entry, dict) and "lat" in entry and "lon" in entry:
                     coords[name] = (entry["lat"], entry["lon"])
         except Exception:
-            pass  # intentionally ignored: coord data optional
+            # 坐标是可选数据, 但坏了要留线索, 否则表象是"永远遇不见人"
+            logger.warning("humanities.json 坐标读取失败", exc_info=True)
 
     # 2) places_patch.json (flat {name: [lat, lon]} or {name: {lat,lon}})
     pp_path = _DATA_DIR / "places_patch.json"
@@ -96,7 +91,7 @@ def _load_place_coords() -> dict[str, tuple[float, float]]:
                         if lat is not None and lon is not None:
                             coords[name] = (lat, lon)
         except Exception:
-            pass  # intentionally ignored: coord data optional
+            logger.warning("places_patch.json 坐标读取失败", exc_info=True)
 
     _place_coords = coords
     return _place_coords
@@ -137,7 +132,12 @@ def find_nearby_person(
 
     for place, dist in candidates:
         entry = data[place]
-        person = entry["person"]
+        if not isinstance(entry, dict):
+            continue
+        # 键访问与 months 的容错口径一致: 坏条目跳过而非 KeyError
+        person = entry.get("person")
+        if not person:
+            continue
         key = f"{place}/{person}"
 
         # months filter
@@ -145,20 +145,22 @@ def find_nearby_person(
         if months and current_month not in months:
             continue
 
-        # Already met this journey? 20% absent
+        # 概率判定只对"最近的合格候选"做一次: 原实现对每个落选候选各掷
+        # 一次骰子, 遇见概率随附近地点数放大为 1-0.6^n, 与文档的
+        # "落在 5km 内 → 40% 出 sight"单次判定语义不符
         if key in seen_people:
             if not force_encounter and rng.random() < 0.20:
-                continue  # absent on revisit
+                return None  # absent on revisit
         else:
             # First encounter: 40% chance (skip if force_encounter)
             if not force_encounter and rng.random() >= 0.40:
-                continue
+                return None
 
         return {
             "person": person,
             "place": place,
-            "sight": entry["sight"],
-            "where": entry["where"],
+            "sight": entry.get("sight", ""),
+            "where": entry.get("where", ""),
             "data": entry,
         }
 
@@ -185,7 +187,7 @@ def talk(
             return knows["text"]
 
     lines = entry.get("lines", [])
-    if line_index < len(lines):
+    if 0 <= line_index < len(lines):
         return lines[line_index]
 
     # 4th+ line: remember you variant

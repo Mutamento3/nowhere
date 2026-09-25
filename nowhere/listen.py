@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import time
@@ -19,6 +20,8 @@ try:
     import httpx
 except ImportError:  # pragma: no cover
     httpx = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────
 
@@ -37,9 +40,11 @@ def _stft_frames(samples: np.ndarray, fft_size: int, hop_size: int) -> np.ndarra
     frames = np.empty((n_frames, fft_size // 2 + 1))
     for i in range(n_frames):
         start = i * hop_size
-        chunk = samples[start : start + fft_size] * window
-        spectrum = np.abs(np.fft.rfft(chunk))
-        frames[i] = spectrum
+        chunk = samples[start : start + fft_size]
+        if len(chunk) < fft_size:
+            # 短输入(约 93ms@22050Hz 以下)补零, 否则与窗形状不匹配会抛 ValueError
+            chunk = np.pad(chunk, (0, fft_size - len(chunk)))
+        frames[i] = np.abs(np.fft.rfft(chunk * window))
     return frames
 
 
@@ -121,11 +126,12 @@ def classify_texture(tempo_density: float, centroid_hz: float) -> str:
 
     Returns one of: ``"sparse"``, ``"smooth"``, ``"dense"``, ``"harsh"``.
 
-    Decision grid::
+    Decision grid (matches implementation)::
 
-                low centroid   high centroid (>3000 Hz)
-        low td    sparse        smooth
-        high td   dense         harsh
+                     low centroid   high centroid (>=4500 Hz)
+            td < 1     sparse          sparse
+            1 <= td < 4  smooth          smooth
+            td >= 4     dense           harsh
 
     """
     HIGH_CENTROID = 4500.0  # Hz
@@ -179,12 +185,14 @@ async def capture(stream_url: str, seconds: int = 10) -> dict:
     """
     try:
         return await _capture_ffmpeg(stream_url, seconds)
-    except Exception:
-        pass  # intentionally ignored: ffmpeg capture failed, falling back to degraded mode
+    except Exception as exc:
+        # 降级是文档化设计, 但失败原因要留痕, 否则线上无从定位
+        logger.warning("ffmpeg capture failed, degrading: %r", exc)
 
     try:
         return await _capture_degraded(stream_url, seconds)
-    except Exception:
+    except Exception as exc:
+        logger.warning("degraded capture failed: %r", exc)
         return _degraded_result()
 
 
@@ -209,14 +217,27 @@ async def _capture_ffmpeg(stream_url: str, seconds: int) -> dict:
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr}")
 
-    # Parse WAV: skip 44-byte RIFF header
+    # Parse WAV: walk RIFF chunks to locate the data chunk.  ffmpeg 的 wav
+    # muxer 会在 fmt 与 data 之间写 LIST/INFO chunk, 固定 44 字节偏移会把
+    # 块头字节当 PCM 解析, 静默产生错误频谱
     raw = proc.stdout
-    if len(raw) < 44:
-        raise ValueError("WAV too short")
+    if len(raw) < 44 or raw[:4] != b"RIFF":
+        raise ValueError("WAV too short or not RIFF")
 
-    pcm = np.frombuffer(raw[44:], dtype=np.int16).astype(np.float32) / 32768.0
-    if len(pcm) == 0:
-        raise ValueError("Empty PCM")
+    pcm: np.ndarray | None = None
+    pos = 12  # RIFF header + "WAVE"
+    while pos + 8 <= len(raw):
+        chunk_id = raw[pos : pos + 4]
+        chunk_size = int.from_bytes(raw[pos + 4 : pos + 8], "little")
+        if chunk_id == b"data":
+            data = raw[pos + 8 : pos + 8 + chunk_size]
+            if len(data) % 2:
+                data = data[:-1]  # 截断产生的奇数字节会让 frombuffer 抛错
+            pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            break
+        pos += 8 + chunk_size + (chunk_size & 1)  # RIFF chunk 按字对齐
+    if pcm is None or len(pcm) == 0:
+        raise ValueError("No data chunk / empty PCM")
 
     return analyze_pcm(pcm, 22050)
 

@@ -10,10 +10,13 @@ import sys
 
 # Windows GBK 终端兼容
 import io
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+if hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", "") \
+        and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.flush()
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-if sys.stdin.encoding and sys.stdin.encoding.lower() != "utf-8":
+if hasattr(sys.stdin, "buffer") and getattr(sys.stdin, "encoding", "") \
+        and sys.stdin.encoding.lower() != "utf-8":
     sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
 
 
@@ -28,7 +31,10 @@ def _parse_walk(arg: str) -> tuple[str, float]:
         return "forward", 2.0
     parts = arg.split()
     direction = parts[0]
-    distance = float(parts[1]) if len(parts) > 1 else 2.0
+    try:
+        distance = float(parts[1]) if len(parts) > 1 else 2.0
+    except ValueError:
+        distance = 2.0  # 与 wait 的容错口径一致: 坏参数回默认值
     return direction, distance
 
 
@@ -37,8 +43,12 @@ def _parse_listen(arg: str) -> int:
 
     ``listen``   → 10
     ``listen 5`` → 5
+    ``listen abc`` → 10 (坏参数回默认值)
     """
-    return int(arg) if arg else 10
+    try:
+        return int(arg) if arg else 10
+    except ValueError:
+        return 10
 
 
 async def main():
@@ -64,20 +74,26 @@ async def main():
     print("  walkto [地名]  — 朝一个地方走过去")
     print("  wait [小时]    — 原地待着,让时间流过去")
     print("  where          — 我在哪")
+    print("  souvenir       — 看看身上带了什么")
+    print("  give           — 放下身上的东西")
+    print("  continue       — 继续上次的旅程")
     print("  providers      — 看感官状态")
     print("  quit           — 退出")
     print()
 
     if start_web:
         print("🌐 网页旁观者层启动中... http://localhost:8077")
-        asyncio.create_task(_start_web())
+        # 持引用防 GC; done_callback 把启动失败(端口占用等)暴露出来
+        web_task = asyncio.create_task(_start_web())
+        web_task.add_done_callback(_log_web_crash)
         print()
 
     while True:
         try:
             # to_thread: 别让 input 阻塞事件循环,网页旁观者要活
+            # (只接 EOFError: Ctrl+C 由 asyncio.run 在外层处理)
             line = (await asyncio.to_thread(input, "🌀 > ")).strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print("\n再见。")
             break
 
@@ -164,7 +180,7 @@ async def main():
                 _print_result(r)
 
             elif cmd == "give":
-                r = server.give_souvenir()
+                r = await server.give_souvenir()
                 _print_result(r)
 
             elif cmd == "continue":
@@ -182,7 +198,7 @@ async def main():
 
             else:
                 print(f"  未知命令: {cmd}")
-                print("  可用: open/walk/listen/look/ask/mark/marks/where/souvenir/give/continue/providers/quit")
+                print("  可用: open/walk/listen/look/ask/mark/marks/where/souvenir/give/continue/postcard/walkto/wait/providers/quit")
 
         except Exception as e:
             print(f"  ❌ 错误: {e}")
@@ -199,7 +215,12 @@ def _print_result(r: dict):
     if data:
         # 显示关键数据
         pos = data.get("position")
-        if pos and isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        # server 的 position 契约是 {"lat": …, "lon": …} 字典
+        if isinstance(pos, dict):
+            plat, plon = pos.get("lat"), pos.get("lon")
+            if isinstance(plat, (int, float)) and isinstance(plon, (int, float)):
+                print(f"  📍 位置: {plat:.4f}, {plon:.4f}")
+        elif isinstance(pos, (list, tuple)) and len(pos) >= 2:
             print(f"  📍 位置: {pos[0]:.4f}, {pos[1]:.4f}")
 
         step = data.get("step")
@@ -246,5 +267,17 @@ async def _start_web():
     await server.serve()
 
 
+def _log_web_crash(task: "asyncio.Task") -> None:
+    """网页旁观者任务崩溃时把异常打印出来, 不再静默吞掉。"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        print(f"  ⚠️ 网页旁观者启动失败: {exc}", file=sys.stderr)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n再见。")

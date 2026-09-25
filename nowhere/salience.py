@@ -16,7 +16,7 @@ Only the top 3 survive; the rest stay silent in the data attachment.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 # ── Card 69: Situation — runtime context for content filtering ──────────
@@ -28,6 +28,9 @@ _CLIMATE_ZONES = [
     (0, 23.5, "热带"),
 ]
 
+# 首匹配优先(表序即优先级): 重叠区按表序取更靠前的区域
+# (如莫斯科同落在 europe/russia, 取 europe)。调整顺序会改变
+# culture_region 判定, 进而影响 permits 硬过滤。
 _REGION_MAP = [
     (43, 50, 5, 18, "alpine"),
     (35, 70, -15, 40, "europe"),
@@ -69,18 +72,24 @@ def _infer_water_type(water_features: list[dict] | None) -> str | None:
     if not water_features:
         return None
     for f in water_features:
-        ftype = f.get("type", "")
-        fname = f.get("name", "")
+        if not isinstance(f, dict):
+            continue
+        ftype = f.get("type") or ""
+        fname = f.get("name") or ""
         if "ocean" in ftype or fname.endswith("海"):
             return "ocean"
     for f in water_features:
-        ftype = f.get("type", "")
-        fname = f.get("name", "")
+        if not isinstance(f, dict):
+            continue
+        ftype = f.get("type") or ""
+        fname = f.get("name") or ""
         if any(k in ftype for k in ("river", "溪", "江", "河")) or any(fname.endswith(k) for k in ("江", "河", "溪")):
             return "river"
     for f in water_features:
-        ftype = f.get("type", "")
-        fname = f.get("name", "")
+        if not isinstance(f, dict):
+            continue
+        ftype = f.get("type") or ""
+        fname = f.get("name") or ""
         if "lake" in ftype or fname.endswith("湖"):
             return "lake"
     return None
@@ -122,7 +131,28 @@ class Situation:
         # No payload = can't check = pass
         if not payload:
             return True
-        # water_features arrives as list[dict]; extract first element for filtering
+
+        # ── water_features: list[dict], 基于特征 type 硬过滤 ──
+        # 生产 payload 的元素只有 name/type/lat/lon 等键(无 biomes/
+        # water_type), 旧分支恒为放行; 改为 type 与 Situation.water_type
+        # (ocean/river/lake)对全部元素匹配: 任一元素相符即放行,
+        # 全部不符才拒绝
+        if kind == "water_features":
+            items = payload if isinstance(payload, list) else [payload]
+            items = [p for p in items if isinstance(p, dict)]
+            if not items or not self.water_type:
+                return True
+            types = set()
+            for p in items:
+                ft = (p.get("type") or "").lower()
+                if ft in ("stream", "canal"):
+                    ft = "river"
+                types.add(ft)
+            if types and self.water_type not in types:
+                return False
+            return True
+
+        # 其余 kind 的 list payload 取首元素过滤(多维水体已在上方处理)
         if isinstance(payload, list):
             payload = payload[0]
         if not isinstance(payload, dict):

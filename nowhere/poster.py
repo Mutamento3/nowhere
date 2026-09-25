@@ -48,7 +48,6 @@ async def generate(
     """按坐标生成纸感海报。成功 True,任何失败都 False(不炸主流程)。"""
     if not available():
         return False
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     label = place or "Nowhere"
     cmd = [
         sys.executable, "-X", "utf8", str(_SCRIPT),
@@ -60,7 +59,9 @@ async def generate(
         "--width", "6", "--height", "4",
         "--output", str(out_path),
     ]
+    proc: asyncio.subprocess.Process | None = None
     try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(_SCRIPT.parent),
@@ -68,22 +69,36 @@ async def generate(
             stderr=asyncio.subprocess.DEVNULL,
         )
         await asyncio.wait_for(proc.wait(), timeout=180)
-        return proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 10_000
-    except Exception:
-        # 超时或失败:先杀子进程,再清理半成品
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 10_000:
+            return True
+        # 失败产物(截断的半成品也算)统一删掉, 防止调用方拿存在性误判成功
         try:
-            proc.terminate()
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except Exception:
+            if out_path.exists():
+                out_path.unlink()
+        except OSError:
+            pass  # intentionally ignored: cleanup of failed poster file
+        return False
+    except (Exception, asyncio.CancelledError):
+        # 超时/失败/协程被取消: 先杀子进程,再清理半成品。
+        # CancelledError 是 BaseException 子类, 不接住它子进程会活到超时
+        if proc is not None:
             try:
-                proc.kill()
-            except Exception:
-                pass  # intentionally ignored: proc.kill() during cleanup
+                if proc.returncode is None:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+            except (Exception, asyncio.CancelledError):
+                try:
+                    if proc.returncode is None:
+                        proc.kill()
+                except (Exception, asyncio.CancelledError):
+                    pass  # intentionally ignored: proc.kill() during cleanup
         try:
             if out_path.exists():
                 out_path.unlink()
         except OSError:
             pass  # intentionally ignored: cleanup of half-built poster file
+        if isinstance(sys.exc_info()[1], asyncio.CancelledError):
+            raise  # 取消要继续向上传播, 不伪装成"生成失败"
         return False
 
 
@@ -188,9 +203,13 @@ def blank(out_path: pathlib.Path, place: str, lat: float, lon: float, surface: s
         ax.text(150, 14, "此处无路可画 · 乌有乡", ha="center", va="center", color=ink,
                 fontproperties=f_small, alpha=0.5, zorder=6)
 
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, facecolor=paper, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out_path, facecolor=paper, bbox_inches="tight", pad_inches=0)
+        finally:
+            # 失败路径不 close 会把 figure 留在 pyplot 全局注册表里,
+            # blank() 作为兜底会被反复调用, 累积成内存泄漏
+            plt.close(fig)
         return True
     except Exception:
         logger.warning("poster render failed", exc_info=True)

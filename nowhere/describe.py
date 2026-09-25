@@ -22,6 +22,7 @@ import logging
 import pathlib
 import random
 import re
+import threading
 from typing import Sequence
 
 from nowhere import places
@@ -71,8 +72,10 @@ def _load_location_scenes() -> dict[str, list[str]]:
     if _LOCATION_SCENES is not None:
         return _LOCATION_SCENES
 
-    _LOCATION_SCENES = {}
-    _LOCATION_SCENES_SEASONAL = {}
+    # 先在局部构建完整字典, 再原子发布到全局: "先赋 {} 再逐行填充"会让
+    # 并发读者(to_thread 工作线程)拿到半成品
+    scenes: dict[str, list[str]] = {}
+    scenes_seasonal: dict[tuple[str, str], list[str]] = {}
     for fname in ["scene_china_enhanced.txt", "scene_world_enhanced.txt",
                    "scene_soundscape.txt", "scene_taste.txt"]:
         fp = _SCENE_DIR / fname
@@ -89,17 +92,19 @@ def _load_location_scenes() -> dict[str, list[str]]:
                 desc = line[bracket_end + 2:]
                 if "|" in bracket_content:
                     place, season = bracket_content.rsplit("|", 1)
-                    _LOCATION_SCENES_SEASONAL.setdefault((place, season), []).append(desc)
+                    scenes_seasonal.setdefault((place, season), []).append(desc)
                 else:
                     place = bracket_content
-                _LOCATION_SCENES.setdefault(place, []).append(desc)
+                scenes.setdefault(place, []).append(desc)
             # No-bracket format: 地名 描述 (world_enhanced)
             elif not line.startswith("["):
                 sp = line.index(" ") if " " in line else -1
                 if sp > 0:
                     place = line[:sp]
                     desc = line[sp + 1:]
-                    _LOCATION_SCENES.setdefault(place, []).append(desc)
+                    scenes.setdefault(place, []).append(desc)
+    _LOCATION_SCENES = scenes
+    _LOCATION_SCENES_SEASONAL = scenes_seasonal
     return _LOCATION_SCENES
 
 
@@ -538,49 +543,56 @@ def _location_offset(rng: random.Random, lat: float, lon: float) -> None:
 
 
 def _pick_scene(pool: list[str], name: str, rng: random.Random, ctx: dict) -> str:
-    """Pick a scene from pool, filtering by metadata constraints and biome/altitude."""
+    """Pick a scene from pool, filtering by metadata constraints and biome/altitude.
+
+    过滤以 (池内下标, 文本) 配对贯穿: scene_meta.json 的 requires 按行号
+    对齐, 用文本反查下标会在池内出现重复文本时错位到最后一行。
+    """
     # Biome/altitude filtering
     biome = ctx.get("biome", "")
     lat = ctx.get("lat", 0)
     elev = ctx.get("elevation", 0)
     abs_lat = abs(lat)
 
-    filtered = pool
+    filtered: list[tuple[int, str]] = list(enumerate(pool))
+
+    def _drop(bad_words: list[str]) -> None:
+        nonlocal filtered
+        filtered = [(i, s) for i, s in filtered if not any(k in s for k in bad_words)]
 
     # Desert: no water-related scenes
     if biome == "desert":
-        desert_bad = ["洒水车", "喷水", "浇花", "水珠", "水溅", "湖面", "鸭子", "泳池", "水帘"]
-        filtered = [s for s in filtered if not any(k in s for k in desert_bad)]
+        _drop(["洒水车", "喷水", "浇花", "水珠", "水溅", "湖面", "鸭子", "泳池", "水帘"])
 
     # High altitude (>3000m): no urban/lowland scenes
     if elev > 3000:
-        high_bad = ["公园", "湖面", "鸭子", "水泥地", "人行道", "路灯", "便利店", "地铁", "小区", "洒水车"]
-        filtered = [s for s in filtered if not any(k in s for k in high_bad)]
+        _drop(["公园", "湖面", "鸭子", "水泥地", "人行道", "路灯", "便利店", "地铁", "小区", "洒水车"])
 
     # Non-tropical: no tropical scenes (tropic of cancer/capricorn ~23.5°)
     if abs_lat >= 24:
-        tropical_bad = ["椰子", "棕榈", "芭蕉", "热带", "芒果", "榴莲"]
-        filtered = [s for s in filtered if not any(k in s for k in tropical_bad)]
+        _drop(["椰子", "棕榈", "芭蕉", "热带", "芒果", "榴莲"])
 
     # Non-polar: no snow/ice scenes (only for non-tundra biomes)
     if abs_lat < 50 and biome not in ("tundra",):
-        cold_bad = ["雪崩", "冰川", "冻土", "极光", "冰裂缝"]
-        filtered = [s for s in filtered if not any(k in s for k in cold_bad)]
+        _drop(["雪崩", "冰川", "冻土", "极光", "冰裂缝"])
 
     # Card 69: summer/spring — exclude winter-specific scene content
     # Prevents "积雪覆盖的林间小路" in August at 60°N
     season = ctx.get("season", "")
     if season in ("summer", "spring") and biome not in ("tundra", "glacier", "polar"):
         _winter_scene_words = ["下雪", "冰雪", "冰封", "冰面", "冰川", "冰冻", "冻土", "严寒", "积雪", "霜冻"]
-        winter_filtered = [s for s in filtered if not any(w in s for w in _winter_scene_words)]
+        winter_filtered = [(i, s) for i, s in filtered if not any(w in s for w in _winter_scene_words)]
         if winter_filtered:
             filtered = winter_filtered
         elif filtered:
-            # All scenes have winter words — return empty (skip this content)
+            # 全带冬景 → 与其余守卫一致返回空(Card 69: 宁可不写),
+            # 不把未过滤的池子重新放回来
             return ""
 
     if not filtered:
-        filtered = pool  # Fallback to unfiltered if all filtered out
+        # 守卫清空了全部候选: 回退未过滤池会把刚被守卫排除的内容
+        # (湖面/下雪/椰子)原样放回, 绕过全部安全过滤
+        return ""
 
     meta = _load_meta().get(name, [])
     if meta:
@@ -596,14 +608,13 @@ def _pick_scene(pool: list[str], name: str, rng: random.Random, ctx: dict) -> st
                 meta_valid_idx.add(i)  # no meta = no constraint = pass
         if not meta_valid_idx:
             return ""
-        pool_to_idx = {s: i for i, s in enumerate(pool)}
-        meta_valid_filtered = [s for s in filtered if pool_to_idx.get(s) in meta_valid_idx]
+        meta_valid_filtered = [s for i, s in filtered if i in meta_valid_idx]
         if meta_valid_filtered:
             return rng.choice(meta_valid_filtered)
         # Meta constraints killed everything after keyword filter — return
         # empty so caller can retry with a different name.
         return ""
-    return rng.choice(filtered)
+    return rng.choice([s for _, s in filtered])
 
 
 # Map surface/biome to scene file name
@@ -1354,19 +1365,15 @@ def render(
     handler = _HANDLERS.get(kind)
     if handler is None:
         return ""
-    # Set biome context for handlers that need it (e.g. water_features)
-    global _CURRENT_BIOME
-    _CURRENT_BIOME = biome or ""
-    # Card 33: set season/lat context for structured filtering
-    global _CURRENT_SEASON, _CURRENT_LAT
-    _CURRENT_SEASON = season or ""
-    _CURRENT_LAT = lat if lat is not None else 0.0
-    # Pass recent_touch to terrain handler via module-level variable
-    global _RECENT_TOUCH
-    _RECENT_TOUCH = recent_touch or set()
-    # Store recent_scenes for dedup across all pools
-    global _RECENT_SCENES
-    _RECENT_SCENES = recent_scenes or []
+    # Set biome context for handlers that need it (e.g. water_features).
+    # 上下文放 threading.local: asyncio.to_thread 工作线程与后台线程会并发
+    # 进入 render(), 模块级全局会让 handler 读到另一个请求的 biome/季节/
+    # 纬度, 渲染出数据-文案矛盾的句子
+    _ctx.biome = biome or ""
+    _ctx.season = season or ""
+    _ctx.lat = lat if lat is not None else 0.0
+    _ctx.recent_touch = recent_touch or set()
+    _ctx.recent_scenes = recent_scenes or []
     return handler(payload, prev, rng)
 
 
@@ -1491,24 +1498,10 @@ def _starts_with_cjk(s: str) -> bool:
     return (0x4E00 <= c <= 0x9FFF) or (0x3400 <= c <= 0x4DBF)
 
 
-# Walk-specific transition phrases — only for walk sections
-_WALK_TRANSITIONS: list[str] = ["走着走着,", "又走了一段,"]
-
-# ── Card 39: connection word semantic slots ─────────────────────────
-# Pools grouped by semantic slot; compose() avoids reusing the same slot.
-_TRANSITION_SLOTS_WALK: dict[str, list[str]] = {
-    "time": ["紧接着,", "没过多会儿,", "走着走着,"],
-    "juxtapose": ["同时,", "这会儿,", "另一边,"],
-    "causal": ["于是,", "因此,"],
-}
-_TRANSITION_SLOTS_ESTABLISH: dict[str, list[str]] = {
-    "juxtapose": ["同时,", "这会儿,"],
-}
-
 # ── Card 39b: narrative role connector pools ───────────────────────
 # 开场/余韵槽为空集——胶水的消失不靠禁,靠结构让胶水无处生根。
-_NARRATIVE_ROLES = ("开场", "深入", "转折", "余韵")
-
+# compose() 只消费本表; 早期的 _WALK_TRANSITIONS/_TRANSITION_SLOTS_*
+# 已随 Card 39/39b 改造废弃删除。
 _ROLE_CONNECTOR_SLOTS: dict[str, dict[str, list[str]]] = {
     "开场": {},  # no connectors — hard cut
     "深入": {
@@ -1678,7 +1671,9 @@ def _load_notable_places() -> set[str]:
     if _NOTABLE_PLACES_CACHE is not None:
         return _NOTABLE_PLACES_CACHE
 
-    places: set[str] = set()
+    # 局部变量不要叫 places —— 会遮蔽模块顶部的 from nowhere import places,
+    # 本文件的 _geocode_segment 依赖那个模块
+    names: set[str] = set()
 
     # Water features scenes: top-level keys are place/river names
     try:
@@ -1688,9 +1683,9 @@ def _load_notable_places() -> set[str]:
             data = _json.loads(fp.read_text(encoding="utf-8"))
             for key in data:
                 if isinstance(key, str) and len(key) < 20:
-                    places.add(key)
+                    names.add(key)
     except Exception:
-        logger.debug("failed to load %s", fp)
+        logger.debug("failed to load water_features_scenes.json")
 
     # Localcolor files: top-level keys are place names
     for lc_file in _SCENE_DIR.glob("localcolor_*.json"):
@@ -1699,12 +1694,12 @@ def _load_notable_places() -> set[str]:
             data = _json.loads(lc_file.read_text(encoding="utf-8"))
             for key in data:
                 if isinstance(key, str) and len(key) < 20:
-                    places.add(key)
+                    names.add(key)
         except Exception:
             logger.debug("failed to load %s", lc_file)
 
-    _NOTABLE_PLACES_CACHE = places
-    return places
+    _NOTABLE_PLACES_CACHE = names
+    return names
 
 
 def sanity_check(text: str, env: dict) -> str:
@@ -1808,11 +1803,17 @@ def sanity_check(text: str, env: dict) -> str:
         # ── Place name contradiction ──
         if place and _scene_places:
             wrong_places = [p for p in _scene_places if p in sent and p != place]
+            # 水系名(黄河/长江/莱茵河等)出现在水文句里是合法的: 河流恰好
+            # 流经当前地。仅当句中的错配地名都不含水系字时才整句替换;
+            # 错配的是城市/地标名(鹿特丹/三峡大坝)则照常替换
             if wrong_places:
-                sentences[i] = _SOFT_FILLERS[filler_idx % len(_SOFT_FILLERS)]
-                filler_idx += 1
-                changed = True
-                continue
+                non_water = [p for p in wrong_places
+                             if not any(w in p for w in ("河", "江", "湖", "溪", "水", "海", "瀑", "潭", "泉"))]
+                if non_water:
+                    sentences[i] = _SOFT_FILLERS[filler_idx % len(_SOFT_FILLERS)]
+                    filler_idx += 1
+                    changed = True
+                    continue
 
         # ── Country name contradiction ──
         if cc:
@@ -1922,9 +1923,11 @@ def _render_terrain(payload: dict, prev: dict | None, rng: random.Random) -> str
         elev_clause = f"海拔 {elevation} 米"
     else:
         elev_clause = ""
+    # 与 elev_clause 同用 d_round 口径: 用原始 delta 判正负会产出
+    # "又抬高了 0 米"这类违反"数字必须有"规则的句子
     delta_clause = (
-        f",又抬高了 {round(elevation_delta)} 米" if elevation_delta > 0
-        else f",又落下了 {abs(round(elevation_delta))} 米" if elevation_delta < 0
+        f",又抬高了 {d_round} 米" if d_round > 0
+        else f",又落下了 {abs(d_round)} 米" if d_round < 0
         else ""
     )
 
@@ -1975,7 +1978,7 @@ def _render_terrain(payload: dict, prev: dict | None, rng: random.Random) -> str
     # Append touch description (filter out recently used)
     touch_pool = _TOUCH_BY_SURFACE.get(surface_key, [])
     if touch_pool:
-        recent = _RECENT_TOUCH | set(_RECENT_SCENES[-10:])
+        recent = _ctx.recent_touch | set(_ctx.recent_scenes[-10:])
         if recent:
             fresh = [t for t in touch_pool if t not in recent]
             if fresh:
@@ -1986,7 +1989,7 @@ def _render_terrain(payload: dict, prev: dict | None, rng: random.Random) -> str
     # Append smell description (filter out recently used)
     smell_pool = _SMELL_BY_BIOME.get(biome, _SMELL_BY_BIOME.get(surface_key, []))
     if smell_pool:
-        recent = _RECENT_TOUCH | set(_RECENT_SCENES[-10:])
+        recent = _ctx.recent_touch | set(_ctx.recent_scenes[-10:])
         if recent:
             fresh = [s for s in smell_pool if s not in recent]
             if fresh:
@@ -2060,12 +2063,12 @@ def _render_sky(payload: dict, prev: dict | None, rng: random.Random) -> str:
         if not moon_str and not planet_str and not milky_str and not aurora_str:
             moon_str = "无月。星星倒是一颗不少。"
 
-        recent = set(_RECENT_SCENES[-10:]) if _RECENT_SCENES else set()
+        recent = set(_ctx.recent_scenes[-10:]) if _ctx.recent_scenes else set()
         tmpl = _pick_fresh(_SKY_NIGHT_VARIANTS, rng, recent)
         return tmpl.format(moon_str=moon_str, planet_str=planet_str, milky_str=milky_str, aurora_str=aurora_str)
 
     sun_alt_r = round(sun_alt)
-    recent = set(_RECENT_SCENES[-10:]) if _RECENT_SCENES else set()
+    recent = set(_ctx.recent_scenes[-10:]) if _ctx.recent_scenes else set()
     if sun_alt_r < 15:
         tmpl = _pick_fresh(_SKY_DAY_LOW_VARIANTS, rng, recent)
     else:
@@ -2075,7 +2078,7 @@ def _render_sky(payload: dict, prev: dict | None, rng: random.Random) -> str:
 
 def _render_water(payload: dict, prev: dict | None, rng: random.Random) -> str:
     sst = round(payload.get("sea_surface_temp", payload.get("sst", 20)))
-    recent = set(_RECENT_SCENES[-10:]) if _RECENT_SCENES else set()
+    recent = set(_ctx.recent_scenes[-10:]) if _ctx.recent_scenes else set()
     if sst < 10:
         tmpl = _pick_fresh(_WATER_COLD_VARIANTS, rng, recent)
     elif sst < 22:
@@ -2108,7 +2111,7 @@ def _render_life(payload: dict, prev: dict | None, rng: random.Random) -> str:
         plant_pool = _load_scenes("plants")
         if plant_pool and rng.random() < 0.6:
             # Filter tropical-only plants for non-tropical biomes
-            cur_biome = _CURRENT_BIOME
+            cur_biome = _ctx.biome
             if cur_biome and cur_biome not in ("rainforest", ""):
                 _tropical_plant_kw = ("竹", "藤", "椰子", "芭蕉", "热带")
                 filtered = [p for p in plant_pool
@@ -2411,64 +2414,6 @@ _TOUCH_BY_SURFACE: dict[str, list[str]] = {
         "脚边有青蛙跳进水里",
     ],
 }
-
-# Card 50: cold touch variants (used when cold > 5)
-_COLD_TOUCH_VARIANTS: list[str] = [
-    "手指是麻的，你搓了搓",
-    "指尖碰了一下金属，粘住了似的",
-    "手背的皮肤裂了一道口子",
-    "你把手缩进袖子里，还是冷",
-    "耳朵尖冻得发疼",
-    "鼻尖是凉的，吸进去的气也是凉的",
-    "你的手指弯起来费劲",
-    "口袋里摸到什么，手已经没知觉了",
-]
-
-# ── River alignment text pool (Card 35: river rendering) ────────────
-# 四种方向: 顺流(downstream)、逆流(upstream)、横渡(crossing)、沿河(along)
-_RIVER_ALIGNMENT_TEXT: dict[str, list[str]] = {
-    "downstream": [
-        "水往下游走,你顺着它。",
-        "河流的方向就是你的方向。水在脚边往低处去。",
-        "顺着水流走。水知道路在哪。",
-        "你跟着河走。水往低处去,你也是。",
-        "河流往下游。你踩着岸边的石头,方向跟水一样。",
-        "水声在下游的方向。你顺着河岸走。",
-        "河往东去。你跟着它,脚下的泥是湿的。",
-        "水流的方向,就是你要去的方向。你顺着走。",
-    ],
-    "upstream": [
-        "你逆着水流走。每一步都要顶着水的脾气。",
-        "河从上游来,你往上游去。水推着你的脚。",
-        "逆流。水从你脚边冲过去,你不让它。",
-        "你朝上游走。水流的方向跟你相反,你不在乎。",
-        "河从上面来,你往上面走。水声一直在耳边。",
-        "逆着河走。脚下的石头被水冲得圆。",
-        "你逆流而上。水在脚踝边打转,你站住了。",
-        "上游的方向。河从那边来,你往那边去。",
-    ],
-    "crossing": [
-        "你踩着石头过河。水在脚踝以下。",
-        "河不宽,你跨了三步就过去了。鞋底湿了。",
-        "你淌水过河。水凉,石头滑,你一步一步地走。",
-        "河在面前。你踩着露出水面的石头,一步一步跨过去。",
-        "你涉水而过。水到膝盖,脚底的石头圆。",
-        "河不深。你提着裤脚走过去,水凉得刺骨。",
-        "你踩着河里的石头过河。每一步都得找稳的。",
-        "过河。水从左边流过来,你从这边走到那边。",
-    ],
-    "along": [
-        "你沿着河走。水声一直在左边。",
-        "河在旁边。你跟它并排走,谁也不等谁。",
-        "沿着河岸。水的声音从始至终都在。",
-        "你走在河边。水面的光落在你脸上。",
-        "河在右边。你沿着它走,脚下的路跟河一样长。",
-        "沿着河走。水里的倒影跟着你走。",
-        "你跟河平行。它走它的,你走你的。",
-        "河岸上有路。你沿着走,水声一直在耳边。",
-    ],
-}
-
 
 def _season(month: int, lat: float) -> str:
     """Get season name from month and latitude.
@@ -2882,11 +2827,17 @@ def render_establish(payload: dict, rng: random.Random) -> str:
 
 
 # ── module-level biome context for handlers that need it ─────────────
-_CURRENT_BIOME: str = ""
-_CURRENT_SEASON: str = ""
-_CURRENT_LAT: float = 0.0
-_RECENT_TOUCH: set[str] = set()
-_RECENT_SCENES: list[str] = []
+# 每线程一份: render() 在同一线程内设置、handler 在同一线程内读取
+class _RenderContext(threading.local):
+    def __init__(self) -> None:
+        self.biome: str = ""
+        self.season: str = ""
+        self.lat: float = 0.0
+        self.recent_touch: set[str] = set()
+        self.recent_scenes: list[str] = []
+
+
+_ctx = _RenderContext()
 _SEG_GEOCODE_CACHE: dict[str, tuple[float, float] | None] = {}
 
 
@@ -2940,7 +2891,7 @@ def _render_water_features(payload: dict | list, prev: dict | None, rng: random.
     then filters by structured card metadata (seasons, lat_band).
     Card 65: checks water_features_scenes.json for named water bodies first.
     """
-    biome = _CURRENT_BIOME
+    biome = _ctx.biome
     features = payload if isinstance(payload, list) else []
 
     # Build feature set from actual data
@@ -3014,8 +2965,8 @@ def _render_water_features(payload: dict | list, prev: dict | None, rng: random.
                         scene_text = seg.get("culture", "") or seg.get("along", "") or ""
                     if scene_text:
                         # Card 33: apply metadata filter to named water scenes too
-                        if _CURRENT_SEASON:
-                            _filtered = filter_by_card_meta([scene_text], _CURRENT_SEASON, _CURRENT_LAT, biome)
+                        if _ctx.season:
+                            _filtered = filter_by_card_meta([scene_text], _ctx.season, _ctx.lat, biome)
                             if _filtered:
                                 return _filtered[0]
                         else:
@@ -3038,8 +2989,8 @@ def _render_water_features(payload: dict | list, prev: dict | None, rng: random.
                     if not any(k in s for k in _WATERFALL_KEYWORDS)]
 
     # Card 33: structured field filtering (replaces keyword blacklist)
-    if pool and _CURRENT_SEASON:
-        pool = filter_by_card_meta(pool, _CURRENT_SEASON, _CURRENT_LAT, biome)
+    if pool and _ctx.season:
+        pool = filter_by_card_meta(pool, _ctx.season, _ctx.lat, biome)
 
     ctx = {"features": feat_set}
     if pool:

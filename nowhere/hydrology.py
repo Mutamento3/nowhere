@@ -91,13 +91,24 @@ def offline_water_nearby(lat: float, lon: float, radius_km: float = 50) -> list[
         return []
     try:
         data = _json.loads(fp.read_text(encoding="utf-8"))
+        entries = data.get("entries", []) if isinstance(data, dict) else []
     except Exception:
+        # 静默吞掉会掩盖数据损坏, 留一条告警便于排查
+        import logging
+        logging.getLogger(__name__).warning(
+            "water_features_offline.json 读取失败, 离线水文不可用", exc_info=True,
+        )
         return []
 
     results: list[dict] = []
-    for entry in data.get("entries", []):
-        elat = entry.get("lat", 0)
-        elon = entry.get("lon", 0)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        elat = entry.get("lat")
+        elon = entry.get("lon")
+        if elat is None or elon is None:
+            # 缺坐标的条目不能以 (0,0) 参与距离/方位计算 → 跳过
+            continue
         entry_radius = entry.get("radius_km", 50)
         dist = _haversine_km(lat, lon, elat, elon)
         # Entry reachable if distance < entry_radius + query_radius
@@ -114,6 +125,8 @@ def offline_water_nearby(lat: float, lon: float, radius_km: float = 50) -> list[
             "bearing": bearing,
             "note": note,
             "label": label,
+            # 与 nearby_water(在线) 的 schema 对齐: 下游键访问不随网络状态漂移
+            "detail": "",
         })
 
     results.sort(key=lambda r: r["distance_km"])
@@ -147,11 +160,15 @@ async def nearby_water(lat: float, lon: float, radius_km: float = 10) -> list[di
         f'  node["waterway"="waterfall"](around:{radius_m},{lat},{lon});'
         f'  way["waterway"="river"]["name"](around:{radius_m},{lat},{lon});'
         f'  relation["waterway"="river"]["name"](around:{radius_m},{lat},{lon});'
+        f'  way["waterway"~"^(stream|canal)$"]["name"](around:{radius_m},{lat},{lon});'
         f');'
         f'out center tags;'
     )
-    url = f"{_OVERPASS_URL}?data={query}"
-    data = await providers.fetch_json(url, source="overpass", cache_ttl=3600, timeout=15.0)
+    # 查询串经 params 提交, 不拼进 URL 字符串(会进入异常文本与缓存键)
+    data = await providers.fetch_json(
+        _OVERPASS_URL, source="overpass", cache_ttl=3600, timeout=15.0,
+        params={"data": query},
+    )
     if data is None:
         return []
 
@@ -186,6 +203,9 @@ async def nearby_water(lat: float, lon: float, radius_km: float = 10) -> list[di
             "distance_km": round(dist, 1),
             "bearing": bearing,
             "detail": detail,
+            # 与 offline_water_nearby schema 对齐
+            "note": None,
+            "label": name or "无名水域",
         })
 
     # Sort by distance first, then deduplicate (closest wins)

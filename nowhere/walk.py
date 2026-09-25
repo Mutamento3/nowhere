@@ -101,14 +101,17 @@ def water_ahead_km(lat: float, lon: float, bearing_deg: float, max_km: float = 2
     d = 1.0
     while d <= max_km:
         lat2, lon2 = terrain.destination(lat, lon, bearing_deg, d)
+        surf = terrain.surface(lat2, lon2)
         if include_fresh:
-            is_target = terrain.is_water(lat2, lon2)
+            is_target = surf.startswith("water")
         else:
-            is_target = terrain.surface(lat2, lon2) == "water_ocean"
+            is_target = surf == "water_ocean"
         if is_target:
             # Card 64: coarse-grid false-ocean gate.  Real ocean is at sea
             # level; "water_ocean" above 1000 m is a grid artifact.
-            if terrain.elevation(lat2, lon2) > 1000:
+            # 闸门只对海水像素生效: include_fresh 承诺检测所有水体,
+            # 高原湖泊/山地河流海拔高但真实存在, 不能当网格假象跳过
+            if (not include_fresh or surf == "water_ocean") and terrain.elevation(lat2, lon2) > 1000:
                 d += 1.0
                 continue
             return d
@@ -147,10 +150,15 @@ def step(
 
     Returns {"blocked", "reason", "entered_water", "elevation_delta",
              "slope_deg", "dist_km", "new_surface", "climbed", "no_gain",
-             "far_slope", "sea_ahead_km", "clamped", "lat_limit"}.
+             "far_slope", "sea_ahead_km", "clamped", "lat_limit",
+             "water_distance_km"}.
 
     DATA-05: every exit returns the same key set — callers must never have to
     guess which keys a particular path happened to populate.
+
+    里程/时间记账契约: 阻挡出口(water/cliff)的里程与耗时由 step() 记账
+    (走过去了只是没穿过); 成功路径的里程由调用方在 Card 20 处记账,
+    step() 不重复累加 —— 否则会双重计数。
 
     max_dist: override the maximum distance per step (Card 50: fatigue cap).
     """
@@ -192,6 +200,7 @@ def step(
                     "sea_ahead_km": None,
                     "clamped": clamped,
                     "lat_limit": False,
+                    "water_distance_km": None,
                 }
     else:
         bearing = _bearing_from_path(state.path)
@@ -221,7 +230,9 @@ def step(
         water_dist = water_ahead_km(lat, lon, bearing, max_km=10.0, include_fresh=True)
         if water_dist is not None and water_dist >= 5.0:
             # Blocked but distance still accumulates (you walked there)
+            # 时间口径与里程一致: 走到了但过不去, 按平地速度计时
             state.total_distance_km += dist_km
+            state.elapsed_hours += dist_km / _LAND_SPEED_KMH
             return {
                 "blocked": True,
                 "reason": "water",
@@ -246,7 +257,9 @@ def step(
 
     if slope_deg > _CLIFF_THRESHOLD_DEG:
         # Blocked but distance still accumulates (you walked there, just couldn't pass)
+        # 时间口径与里程一致: 按平地速度估算耗时(坡度未知, 不打折)
         state.total_distance_km += dist_km
+        state.elapsed_hours += dist_km / _LAND_SPEED_KMH
         result = {
             "blocked": True,
             "reason": "cliff",
@@ -261,6 +274,7 @@ def step(
             "sea_ahead_km": None,
             "clamped": clamped,
             "lat_limit": lat_limit_reached,
+            "water_distance_km": None,
         }
         return result
 
@@ -319,5 +333,8 @@ def step(
         "sea_ahead_km": sea_ahead,
         "clamped": clamped,
         "lat_limit": lat_limit_reached,
+        "water_distance_km": None,
     }
+    # 成功路径不在此累加 total_distance_km: 调用方(server Card 20)记账。
+    # 但 lat_limit 提前返回的调用方必须自行补记, 否则真实行走漏账。
     return result

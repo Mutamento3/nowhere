@@ -16,13 +16,18 @@ import asyncio
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 
-# GBK console fix
-sys.stdout.reconfigure(encoding="utf-8")
+# GBK console fix (pytest capsys / StringIO 等环境没有 reconfigure 能力)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+# qa_probe 的模块级 _results 是全局可变状态, 串行化 clear→main→快照
+_qa_probe_lock = threading.Lock()
 
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 _REPORT = _REPO / "health_report.md"
@@ -123,14 +128,14 @@ def _run_probe() -> SectionResult:
     try:
         from nowhere.tests import qa_probe
 
-        # Reset module-level results
-        qa_probe._results.clear()
+        # 串行化对模块级全局的复合操作, 并立刻快照为局部变量再解析
+        results_snapshot: list[dict] = []
+        with _qa_probe_lock:
+            qa_probe._results.clear()
+            qa_probe.main()
+            results_snapshot = list(qa_probe._results)
 
-        # Run all probes (these are lightweight, no network)
-        qa_probe.main()
-
-        # Collect results from the module-level list
-        for r in qa_probe._results:
+        for r in results_snapshot:
             level = "pass" if r["pass"] else "fail"
             findings.append(Finding(
                 id=f"PRB-{r['probe'][:20]}", source="probe", level=level,
@@ -333,6 +338,17 @@ def _run_pytest() -> SectionResult:
 
         output = result.stdout + result.stderr
 
+        if result.returncode not in (0, 1):
+            # >=2 = usage error / internal error / no tests collected 等,
+            # 输出不含可信统计摘要, 不许落进 "0 failed" 的假阳性分支
+            findings.append(Finding(
+                id="TEST-ERR", source="tests", level="fail",
+                phenomenon=f"pytest 异常退出 (returncode={result.returncode}), 无可信统计摘要",
+                reproduction="python -m pytest nowhere/tests -q",
+                detail=output[-500:] if len(output) > 500 else output,
+            ))
+            return SectionResult(source="tests", elapsed=time.time() - t0, findings=findings)
+
         # Parse pytest output: "X passed, Y failed, Z errors"
         import re
         passed = failed = errors = skipped = 0
@@ -349,12 +365,20 @@ def _run_pytest() -> SectionResult:
         if m:
             skipped = int(m.group(1))
 
-        total = passed + failed + errors
         if failed == 0 and errors == 0:
-            findings.append(Finding(
-                id="TEST-ALL", source="tests", level="pass",
-                phenomenon=f"pytest: {passed} passed, {skipped} skipped",
-            ))
+            if result.returncode == 1:
+                # rc=1 却解析不到失败数: 输出格式异常, 不当放行
+                findings.append(Finding(
+                    id="TEST-SUMMARY", source="tests", level="fail",
+                    phenomenon="pytest 返回 1 但输出中解析不到 failed/errors 统计",
+                    reproduction="python -m pytest nowhere/tests -q",
+                    detail=output[-500:] if len(output) > 500 else output,
+                ))
+            else:
+                findings.append(Finding(
+                    id="TEST-ALL", source="tests", level="pass",
+                    phenomenon=f"pytest: {passed} passed, {skipped} skipped",
+                ))
         else:
             findings.append(Finding(
                 id="TEST-SUMMARY", source="tests", level="fail",
@@ -364,11 +388,14 @@ def _run_pytest() -> SectionResult:
             ))
             # Extract failed test names
             for line in output.splitlines():
-                if "FAILED" in line:
+                line = line.strip()
+                if line.startswith("FAILED"):
+                    # 剥掉 "FAILED " 前缀再取文件路径, 否则生成无效命令
+                    test_path = line[len("FAILED"):].split("::")[0].strip()
                     findings.append(Finding(
-                        id=f"TEST-{line.strip().split('::')[-1][:30]}", source="tests", level="fail",
-                        phenomenon=line.strip(),
-                        reproduction=f"python -m pytest {line.split('::')[0]} -v",
+                        id=f"TEST-{line.split('::')[-1][:30]}", source="tests", level="fail",
+                        phenomenon=line,
+                        reproduction=f"python -m pytest {test_path} -v" if test_path else "python -m pytest nowhere/tests -q --tb=line",
                     ))
 
     except subprocess.TimeoutExpired:
@@ -398,7 +425,7 @@ async def _run_all_parallel() -> list[SectionResult]:
     alongside the lighter geocode/alignment checks.
     pytest runs in a subprocess (already separate process).
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     pool = ThreadPoolExecutor(max_workers=5)
 
     # Submit all tasks
@@ -500,8 +527,8 @@ def _generate_report(sections: list[SectionResult], total_elapsed: float) -> str
             prev = prev_path.read_text(encoding="utf-8")
             # Simple diff: find fail IDs in current that are not in previous
             import re
-            prev_ids = set(re.findall(r"\| (GEO|PRB|ALN|LQA|TEST)-\S+ \|", prev))
-            curr_ids = set(re.findall(r"\| (GEO|PRB|ALN|LQA|TEST)-\S+ \|",
+            prev_ids = set(re.findall(r"\| ((?:GEO|PRB|ALN|LQA|TEST)-\S+) \|", prev))
+            curr_ids = set(re.findall(r"\| ((?:GEO|PRB|ALN|LQA|TEST)-\S+) \|",
                                        "\n".join(lines)))
             new_ids = curr_ids - prev_ids
             if new_ids:

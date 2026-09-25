@@ -9,6 +9,7 @@ import hashlib
 import json
 import pathlib
 import sqlite3
+import sys
 
 _DB_PATH = pathlib.Path(__file__).resolve().parent / "content.db"
 _SRC_PATH = pathlib.Path(__file__).resolve().parent.parent / "content_src"
@@ -50,9 +51,15 @@ def cards(pool: str, key: str | None = None,
     result = []
     for row in rows:
         c = row["constraints"]
+        try:
+            constraints = json.loads(c) if c else None
+        except (json.JSONDecodeError, TypeError) as exc:
+            # 一条脏数据不该让整个卡池不可用
+            print(f"[content] bad constraints in {pool}: {exc}", file=sys.stderr)
+            constraints = None
         result.append({
             "text": row["text"],
-            "constraints": json.loads(c) if c else None,
+            "constraints": constraints,
         })
     return result
 
@@ -67,7 +74,11 @@ def fresh() -> bool:
         fp = _SRC_PATH / src_file
         if not fp.exists():
             return False
-        actual = hashlib.sha1(fp.read_bytes()).hexdigest()
+        try:
+            actual = hashlib.sha1(fp.read_bytes()).hexdigest()
+        except OSError:
+            # exists() 之后仍可能权限/IO 失败或被并发删除(TOCTOU) → 按不新鲜
+            return False
         if actual != expected:
             return False
     return True

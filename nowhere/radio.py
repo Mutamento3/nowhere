@@ -25,6 +25,9 @@ _FALLBACK_PATH: Final = _DATA_DIR / "radio_fallback.json"
 
 _EARTH_RADIUS_KM: Final = 6371.0
 
+# 兜底清单是静态资源, 模块级缓存一次(每次请求重复读盘会阻塞事件循环)
+_fallback_cache: list[dict] | None = None
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -32,11 +35,14 @@ from nowhere.terrain import haversine_km as _haversine_km
 
 
 def _load_fallback() -> list[dict]:
-    try:
-        with open(_FALLBACK_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return []  # intentionally ignored: fallback data missing
+    global _fallback_cache
+    if _fallback_cache is None:
+        try:
+            with open(_FALLBACK_PATH, encoding="utf-8") as f:
+                _fallback_cache = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            _fallback_cache = []  # intentionally ignored: fallback data missing
+    return _fallback_cache
 
 
 def _pick_nearest_from_fallback(lat: float, lon: float, country_code: str | None = None) -> dict | None:
@@ -103,20 +109,12 @@ def _pick_nearest_from_fallback(lat: float, lon: float, country_code: str | None
         st_lon = st.get("lon")
         if st_lat is None or st_lon is None:
             continue
-        # Card 71: reject stations from wrong country
         if country_code and st.get("country", "") != country_code:
             continue
         d = _haversine_km(lat, lon, st_lat, st_lon)
         if d < best_dist:
             best_dist = d
             best = st
-
-    if best is None:
-        return None
-
-    # If within 3000 km, return directly
-    if best_dist <= _MAX_NEARBY_KM:
-        return best
 
     # 4. Find nearest region by computing distance to each region's centroid
     _REGION_CENTROIDS: dict[str, tuple[float, float]] = {
@@ -128,31 +126,31 @@ def _pick_nearest_from_fallback(lat: float, lon: float, country_code: str | None
         "mideast":  (30.0, 45.0),
     }
 
-    nearest_region = None
-    region_dist = math.inf
-    for rname, (rlat, rlon) in _REGION_CENTROIDS.items():
-        d = _haversine_km(lat, lon, rlat, rlon)
-        if d < region_dist:
-            region_dist = d
-            nearest_region = rname
+    def _region_best() -> dict | None:
+        nearest_region = None
+        region_dist = math.inf
+        for rname, (rlat, rlon) in _REGION_CENTROIDS.items():
+            d = _haversine_km(lat, lon, rlat, rlon)
+            if d < region_dist:
+                region_dist = d
+                nearest_region = rname
+        if nearest_region is None:
+            return None
+        rep_ccs = _REGION_REPS.get(nearest_region, [])
+        return _find_nearest(rep_ccs)
 
-    if nearest_region is None:
-        return best  # should not happen
+    if best is None:
+        # 同国无台(国界附近/清单缺国) → 返回 None 落到在线 API。
+        # 不做跨 cc 兜底: Card 71 B2 明确 cc 不匹配即拒绝(利比亚不能拿
+        # 希腊台, 布达佩斯不能拿捷克站), 宁可离线安静也不配错台
+        return None
 
-    # 5. From that region, pick the nearest station to the user
-    rep_ccs = _REGION_REPS.get(nearest_region, [])
-    region_best: dict | None = None
-    region_best_dist = math.inf
-    for cc in rep_ccs:
-        for st in _by_cc.get(cc, []):
-            st_lat = st.get("lat")
-            st_lon = st.get("lon")
-            if st_lat is None or st_lon is None:
-                continue
-            d = _haversine_km(lat, lon, st_lat, st_lon)
-            if d < region_best_dist:
-                region_best_dist = d
-                region_best = st
+    # If within 3000 km, return directly
+    if best_dist <= _MAX_NEARBY_KM:
+        return best
+
+    # 5. From that region, pick the nearest station to the user (复用 _find_nearest)
+    region_best = _region_best()
 
     return region_best or best
 
@@ -210,15 +208,12 @@ async def nearest(lat: float, lon: float, country_code: str | None, rng: random.
                                 best = st
                         st = best or data[0]
                         name = st.get("name") or "Unknown"
-                        result = {
+                        return {
                             "name": name,
                             "genre": st.get("tags", ""),
                             "stream_url": st.get("url_resolved", st.get("url", "")),
                             "homepage": st.get("homepage", ""),
                         }
-                        if not st.get("name"):
-                            result["source"] = "fallback"
-                        return result
                 except (httpx.HTTPError, httpx.TimeoutException, ValueError):
                     continue  # intentionally ignored: per-station network failure, try next
 

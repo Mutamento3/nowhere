@@ -99,11 +99,12 @@ def _climate_fallback(lat: float, lon: float, elevation: float | None = None,
     temp = _CLIMATE_TEMP[zone][month - 1]  # list is 0-indexed, month is 1-indexed
     # Diurnal (day/night) temperature variation
     if local_hour is not None:
-        # Trough at 05:00, peak at ~11:00 (sine wave, period=24h)
+        # Trough at 05:00, peak at ~17:00 (cosine, period=24h):
+        # 最低温在日出前, 24h 周期的峰谷必相差 12h
         # Amplitude: ±12°C for equator/subtropical, ±8°C for temperate
         amplitude = 12.0 if zone in ("equator", "subtropical") else 8.0
         hour_angle = (local_hour - 5) * (2 * math.pi / 24)  # trough at 5am
-        temp += amplitude * math.sin(hour_angle)
+        temp -= amplitude * math.cos(hour_angle)
     # Atmospheric lapse rate correction: ~6.5°C per 1000m
     if elevation and elevation > 0:
         temp -= elevation * 0.0065
@@ -151,7 +152,8 @@ async def _try_qweather(lat: float, lon: float) -> dict[str, Any] | None:
     try:
         temp = float(now["temp"])
         feels = float(now["feelsLike"])
-        wind = float(now["windSpeed"])
+        # QWeather windSpeed 的单位是 km/h, 字段契约为 m/s → 换算
+        wind = float(now["windSpeed"]) / 3.6
         humidity = float(now["humidity"])
         text = now.get("text", "")
     except (KeyError, ValueError, TypeError):
@@ -184,6 +186,7 @@ async def _try_openmeteo(lat: float, lon: float) -> dict[str, Any] | None:
         f"?latitude={lat}&longitude={lon}"
         f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
         f"precipitation,weather_code,wind_speed_10m,cloud_cover"
+        f"&wind_speed_unit=ms"  # 默认 km/h, 字段契约为 m/s
     )
     data = await providers.fetch_json(url, source="openmeteo", cache_ttl=300)
     if data is None:
@@ -197,7 +200,9 @@ async def _try_openmeteo(lat: float, lon: float) -> dict[str, Any] | None:
         humidity = float(cur["relative_humidity_2m"])
         wind = float(cur["wind_speed_10m"])
         code = int(cur["weather_code"])
-        precip_val = float(cur.get("precipitation", 0))
+        # 降水为 null 时按 0 处理, 不为一个非关键字段丢整条在线数据
+        raw_precip = cur.get("precipitation")
+        precip_val = float(raw_precip) if raw_precip is not None else 0.0
     except (KeyError, ValueError, TypeError):
         return None
     # Look up WMO code

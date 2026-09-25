@@ -94,6 +94,9 @@ class WorldState:
         self.fatigue: float = 0.0  # 0-10, +1/hour walk, -2/hour wait
         # ── Card 82: force new slug on next save (transient, not persisted) ──
         self.force_new_slug: bool = False
+        # 本旅程所属的持久化 slug: save_current 优先用它, 防止带后缀的旅程
+        # (如 上海-2)在后续保存时回落到基础 slug 覆盖同名旧旅程
+        self.journey_slug: str | None = None
 
     def now(self) -> datetime | None:
         """Return the current simulated UTC time: landed_at + elapsed_hours."""
@@ -162,21 +165,20 @@ class WorldState:
             "wet": self.wet,
             "wet_rain_steps": self.wet_rain_steps,
             "fatigue": self.fatigue,
+            # journeys.save_current 的所属 slug (跨会话保持旅程与文件对应)
+            "journey_slug": self.journey_slug,
         }
-
-    @classmethod
-    def migrate(cls, data: dict) -> dict:
-        """Migrate old save data to current version. Stub for future use."""
-        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "WorldState":
         """Restore state from a dict (used by load() and journeys.py)."""
         version = data.get("save_version", 0)
-        if version == 0:
-            pass  # 老档,全兼容
-        elif version > 1:
-            data = cls.migrate(data)
+        if version > 1:
+            # migrate() 尚未实现: 直接按 v1 解析会把未来版本字段静默丢弃,
+            # 下次 save() 又会把档改写回 v1 —— 拒绝加载以保留原档
+            raise ValueError(
+                f"不支持的存档版本 {version} (当前最高 1), 拒绝加载以免静默降级"
+            )
         s = cls()
         if data.get("pos"):
             s.pos = tuple(data["pos"])
@@ -253,6 +255,7 @@ class WorldState:
             s.env_at = datetime.fromisoformat(data["env_at"])
             if s.env_at.tzinfo is None:
                 s.env_at = s.env_at.replace(tzinfo=timezone.utc)
+        s.journey_slug = data.get("journey_slug")
         return s
 
     def save(self) -> None:
@@ -261,14 +264,23 @@ class WorldState:
         payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
         fd, tmp_name = tempfile.mkstemp(prefix="journey-", suffix=".tmp", dir=_SAVE_DIR)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            try:
+                tmp = os.fdopen(fd, "w", encoding="utf-8")
+            except BaseException:
+                os.close(fd)  # fdopen 失败时 fd 未移交 with, 显式关闭防泄漏
+                raise
+            with tmp:
                 tmp.write(payload)
                 tmp.flush()
                 os.fsync(tmp.fileno())
             os.replace(tmp_name, _SAVE_FILE)
-        finally:
-            if os.path.exists(tmp_name):
+        except BaseException:
+            # 清理失败不许遮蔽原始异常; UnicodeEncodeError 等非 OSError 也覆盖
+            try:
                 os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def load(cls) -> "WorldState | None":
@@ -282,11 +294,22 @@ class WorldState:
             import logging
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup = _SAVE_FILE.with_name(f"journey.json.broken_{ts}")
+            backup_ok = False
             try:
                 os.replace(str(_SAVE_FILE), str(backup))
+                backup_ok = True
             except OSError:
-                pass  # intentionally ignored: backup rename failure, will still reinitialize
-            msg = f"存档读不出来,已备份到 {backup.name},旅程重新开始"
+                # 改名失败(如 Windows 文件占用)退回复制保底, 否则坏档是唯一
+                # 残留副本, 下一次 save() 会把它直接覆盖掉
+                try:
+                    backup.write_bytes(_SAVE_FILE.read_bytes())
+                    backup_ok = True
+                except OSError:
+                    pass
+            if backup_ok:
+                msg = f"存档读不出来,已备份到 {backup.name},旅程重新开始"
+            else:
+                msg = f"存档读不出来且备份失败,坏档保留在 {backup.name}(未改名),旅程重新开始"
             logging.getLogger(__name__).warning("%s (%s)", msg, exc)
             return None
 

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import datetime
 import hashlib
-import math
 import random
 from typing import Final
 
@@ -130,6 +129,16 @@ def describe_sst(sst: float, rng: random.Random) -> str:
 
 # ── Marine life encounters ───────────────────────────────────────────
 
+# 物种 → 场景关键词: iNat 的学名是拉丁文, 英文词匹配不上; 优先对
+# preferred_common_name(locale=zh-CN)的中文名匹配, 学名作补充
+_TAXON_SCENE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "mollusk": ("mollusk", "贝", "螺", "牡蛎", "蛤", "鱿", "章鱼"),
+    "crab": ("crab", "蟹"),
+    "coral": ("coral", "珊瑚"),
+    "turtle": ("turtle", "龟"),
+    "whale": ("whale", "dolphin", "鲸", "豚", "海豹"),
+}
+
 _MARINE_SCENES: dict[str, list[str]] = {
     "fish": [
         "你看见水下有银色的影子在动。一群鱼,不知道什么品种。它们转了个弯,鳞片反了一下光。",
@@ -248,11 +257,15 @@ async def marine_life(lat: float, lon: float, rng: random.Random, *, biome: str 
                     dist = max(10, min(int(dist * 1000), 15000))
                 else:
                     dist = rng.randint(50, 500)
-                # Pick scene by taxon
-                taxon_lower = taxon.get("name", "").lower()
+                # Pick scene by taxon: iNat 的 name 是拉丁学名, 用英文常用词
+                # 对学名做子串匹配几乎永不命中 → 全部落到 fish。改为对
+                # preferred_common_name(locale=zh-CN 下为中文名)做中英关键
+                # 词映射选场景, 学名匹配保留作补充
+                common_lower = (common_name or "").lower()
+                latin_lower = (taxon.get("name") or "").lower()
                 scene_key = "fish"
-                for key in ("mollusk", "crab", "coral", "turtle", "whale"):
-                    if key in taxon_lower:
+                for key, kws in _TAXON_SCENE_KEYWORDS.items():
+                    if any(kw in common_lower or kw in latin_lower for kw in kws):
                         scene_key = key
                         break
                 scene = rng.choice(_MARINE_SCENES.get(scene_key, _MARINE_SCENES["fish"]))

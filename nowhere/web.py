@@ -15,7 +15,7 @@ POST /postcard/{id}/reply -> 人回明信片
 
 from __future__ import annotations
 
-import json
+import asyncio
 import math
 import pathlib
 import re
@@ -72,6 +72,22 @@ def _check_injection(text: str) -> bool:
             return True
     return False
 
+
+# 会进入 LLM 上下文的自由文本字段统一上限(topic/text/note/place/to/traveler_name)
+_USER_TEXT_MAX_LEN = 1000
+
+
+def _sanitize_user_text(value: str) -> str | None:
+    """进入 AI 上下文前的统一入口: 先清控制字符/零宽字符, 再查注入。
+
+    判空必须放在清洗之后 —— 纯控制字符输入会先通过非空校验再被清成空串。
+    被注入检查拒绝时返回 None。
+    """
+    value = _strip_control_chars(value)
+    if _check_injection(value):
+        return None
+    return value
+
 _STATIC_DIR = pathlib.Path(__file__).resolve().parent / "static"
 
 
@@ -86,21 +102,23 @@ def _state():
 async def get_history(_request: Request) -> JSONResponse:
     """落点、当前路径和持久化的旅行足迹。"""
     s = _state()
+    landings = await asyncio.to_thread(placememory.landings)
+    footprints = await asyncio.to_thread(placememory.journey_footprints)
     return JSONResponse({
-        "landings": placememory.landings(),
+        "landings": landings,
         "path": s.path,
-        "footprints": placememory.journey_footprints(),
+        "footprints": footprints,
     })
 
 
 async def get_marks(_request: Request) -> JSONResponse:
     """全部标记。"""
-    return JSONResponse(marks_mod.all())
+    return JSONResponse(await asyncio.to_thread(marks_mod.all))
 
 
 async def get_sightings(_request: Request) -> JSONResponse:
     """动物目击编录。"""
-    return JSONResponse(placememory.sightings())
+    return JSONResponse(await asyncio.to_thread(placememory.sightings))
 
 
 async def index(_request: Request):
@@ -141,7 +159,11 @@ async def state(_request: Request) -> JSONResponse:
     # ({elevation, surface, ...}) shapes appear in the codebase.
     env_info: dict | None = None
     if s.last_env:
-        weather = s.last_env.get("weather", {})
+        # 上游会写 "weather": env.get("weather")(键在值可能为 None),
+        # 持久化恢复后同样可能拿到 None → 裸 .get 会 AttributeError
+        weather = s.last_env.get("weather")
+        if not isinstance(weather, dict):
+            weather = {}
         nested_terrain = s.last_env.get("terrain")
         if isinstance(nested_terrain, dict):
             terrain = nested_terrain
@@ -178,18 +200,17 @@ async def post_message(request: Request) -> JSONResponse:
     content = body.get("content", "")
     if not isinstance(content, str):
         return _bad_request("bad_content")
+    content = _sanitize_user_text(content)
+    if content is None:
+        return _bad_request("rejected")
     content = content.strip()
     if not content:
         return JSONResponse({"ok": False, "error": "empty content"}, status_code=400)
-    # -- Injection guard --
-    content = _strip_control_chars(content)
-    if _check_injection(content):
-        return _bad_request("rejected")
     truncated = len(content) > _MSG_MAX_LEN
     content = content[:_MSG_MAX_LEN]
     state = _state()
     state.messages.append({"content": content, "encountered": False})
-    state.save()
+    await asyncio.to_thread(state.save)
     payload: dict = {"ok": True, "queued": len(state.messages)}
     if truncated:
         payload["truncated"] = True
@@ -203,7 +224,7 @@ async def get_messages(_request: Request) -> JSONResponse:
 
 async def get_postcards(_request: Request) -> JSONResponse:
     """明信片墙: 落盘文件是真相——任何进程寄的都在,新的在前。"""
-    return JSONResponse(placememory.postcards())
+    return JSONResponse(await asyncio.to_thread(placememory.postcards))
 
 
 async def reply_postcard(request: Request) -> JSONResponse:
@@ -215,16 +236,15 @@ async def reply_postcard(request: Request) -> JSONResponse:
     content = body.get("content", "")
     if not isinstance(content, str):
         return _bad_request("bad_content")
+    content = _sanitize_user_text(content)
+    if content is None:
+        return _bad_request("rejected")
     content = content.strip()
     if not content:
         return JSONResponse({"ok": False, "error": "empty content"}, status_code=400)
-    # -- Injection guard --
-    content = _strip_control_chars(content)
-    if _check_injection(content):
-        return _bad_request("rejected")
     truncated = len(content) > _REPLY_MAX_LEN
     content = content[:_REPLY_MAX_LEN]
-    result = reply_postcard_impl(card_id, content)
+    result = await _server._run_serialized(reply_postcard_impl, card_id, content)
     if truncated:
         result = {**result, "truncated": True}
     return JSONResponse(result, status_code=200 if result["ok"] else 404)
@@ -277,9 +297,19 @@ async def api_open_door(request: Request) -> JSONResponse:
     to = body.get("to")
     if to is not None and not isinstance(to, str):
         return _bad_request("bad_to")
+    if isinstance(to, str):
+        to = _sanitize_user_text(to)
+        if to is None:
+            return _bad_request("rejected")
+        to = to[:_USER_TEXT_MAX_LEN]
     traveler_name = body.get("traveler_name")
     if traveler_name is not None and not isinstance(traveler_name, str):
         return _bad_request("bad_traveler_name")
+    if isinstance(traveler_name, str):
+        traveler_name = _sanitize_user_text(traveler_name)
+        if traveler_name is None:
+            return _bad_request("rejected")
+        traveler_name = traveler_name[:_USER_TEXT_MAX_LEN]
     r = await _server.open_door_impl(to=to, traveler_name=traveler_name)
     return _json_or_text(r)
 
@@ -321,6 +351,10 @@ async def api_ask(request: Request) -> JSONResponse:
     topic = body.get("topic", "")
     if not isinstance(topic, str):
         return _bad_request("bad_topic")
+    topic = _sanitize_user_text(topic)
+    if topic is None:
+        return _bad_request("rejected")
+    topic = topic[:_USER_TEXT_MAX_LEN]
     r = await _server.ask_impl(topic=topic)
     return _json_or_text(r)
 
@@ -332,7 +366,11 @@ async def api_send_postcard(request: Request) -> JSONResponse:
     text = body.get("text", "")
     if not isinstance(text, str):
         return _bad_request("bad_text")
-    r = _server.send_postcard_impl(text=text)
+    text = _sanitize_user_text(text)
+    if text is None:
+        return _bad_request("rejected")
+    text = text[:_USER_TEXT_MAX_LEN]
+    r = await _server._run_serialized(_server.send_postcard_impl, text=text)
     return _json_or_text(r)
 
 
@@ -362,12 +400,18 @@ async def api_mark(request: Request) -> JSONResponse:
         return _bad_request("bad_name")
     if not isinstance(note, str):
         return _bad_request("bad_note")
+    name = _sanitize_user_text(name)
+    if name is None:
+        return _bad_request("rejected")
+    note = _sanitize_user_text(note)
+    if note is None:
+        return _bad_request("rejected")
     name = name.strip()
     if not name:
         return _bad_request("empty_name")
     if len(name) > 200 or len(note) > 1000:
         return _bad_request("too_long")
-    r = _server.mark_impl(name=name, note=note)
+    r = await _server._run_serialized(_server.mark_impl, name=name, note=note)
     return _json_or_text(r)
 
 
@@ -378,6 +422,9 @@ async def api_walk_to(request: Request) -> JSONResponse:
     place = body.get("place", "")
     if not isinstance(place, str):
         return _bad_request("bad_place")
+    place = _sanitize_user_text(place)
+    if place is None:
+        return _bad_request("rejected")
     place = place.strip()
     if not place:
         return _bad_request("empty_place")

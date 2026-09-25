@@ -20,6 +20,9 @@ from nowhere import baked, cards as _cards
 _DATA_DIR = pathlib.Path(__file__).resolve().parent / "data"
 
 _lc_cards: list[_cards.Card] | None = None
+# _lc_cards 加载后只读, 计数/集合随首次访问构建缓存 (draw 是 walk 热路径)
+_counts_cache: dict[str, int] | None = None
+_places_cache: set[str] | None = None
 
 # ── Card 54: thin-place speed limit ────────────────────────────────────
 _THIN_THRESHOLD: int = 5   # places with fewer effective cards are "thin"
@@ -51,17 +54,25 @@ def _conditions_pass(
 
 
 def _place_card_count() -> dict[str, int]:
-    """Count effective (non-rhythm) cards per place."""
-    counts: dict[str, int] = {}
-    for c in _load():
-        if c.conditions.get("place") and c.meta.get("category") != "节律":
-            place = c.conditions["place"]
-            counts[place] = counts.get(place, 0) + 1
-    return counts
+    """Count effective (non-rhythm) cards per place (cached)."""
+    global _counts_cache
+    if _counts_cache is None:
+        counts: dict[str, int] = {}
+        for c in _load():
+            if c.conditions.get("place") and c.meta.get("category") != "节律":
+                place = c.conditions["place"]
+                counts[place] = counts.get(place, 0) + 1
+        _counts_cache = counts
+    return _counts_cache
 
 
 def is_thin_place(place_name: str | None) -> bool:
-    """A place is thin if it has fewer than _THIN_THRESHOLD effective cards."""
+    """A place is thin if it has fewer than _THIN_THRESHOLD effective cards.
+
+    口径说明: 稀薄判定只看手写层(非节律)。Card 54 的限速针对的是
+    "几步就抽空的手写卡"; 烘焙植被是罐头层, 不参与限速 —— 与 has_place
+    的"有货"判定是有意分开的两套口径 (test_thin_place 钉住此语义)。
+    """
     if not place_name:
         return False
     return _place_card_count().get(place_name, 0) < _THIN_THRESHOLD
@@ -89,12 +100,21 @@ def _load() -> list[_cards.Card]:
 
 
 def _places_set() -> set[str]:
-    """Get the set of place names that have localcolor cards."""
-    return {c.conditions.get("place") for c in _load() if c.conditions.get("place")}
+    """Get the set of place names that have localcolor cards (cached)."""
+    global _places_cache
+    if _places_cache is None:
+        _places_cache = {
+            c.conditions.get("place") for c in _load() if c.conditions.get("place")
+        }
+    return _places_cache
 
 
 def has_place(place_name: str | None) -> bool:
-    """手写层或烘焙层有货就算有这个地方。"""
+    """手写层或烘焙植被层有货就算有这个地方。
+
+    注意口径: "烘焙层"这里只指植被; 美食是国家级兜底, draw() 里单独处理,
+    不参与本判定。
+    """
     if not place_name:
         return False
     return place_name in _places_set() or bool(baked.flora_items(place_name))
@@ -139,8 +159,18 @@ def draw(
         c for c in _load()
         if c.conditions.get("place") == place_name and c.id not in seen
     ]
-    unseen_handwritten = len(handwritten_cards)
-    has_local_food = False
+    # 与 _place_card_count 同口径: 只数非节律卡, 否则节律卡会把
+    # unseen==0 的烘焙层闸门永久顶死
+    unseen_handwritten = sum(
+        1 for c in handwritten_cards if c.meta.get("category") != "节律"
+    )
+    # "本地有没有特色美食"看全部美食卡(含已见、含时间条件不匹配的),
+    # 只看本次未见池会让夜间限定美食让白天误判为无
+    has_local_food = any(
+        c.conditions.get("place") == place_name
+        and c.meta.get("category") == "美食"
+        for c in _load()
+    )
     for c in handwritten_cards:
         cat = c.meta.get("category", "")
         # 节律卡由 rhythm_event() 单独处理,不进普通池
@@ -150,8 +180,6 @@ def draw(
         if not _conditions_pass(c, local_hour=local_hour, month=month, weekday=weekday):
             continue
         pool.append((cat, c.id, c.text, w))
-        if cat == "美食":
-            has_local_food = True
 
     # 级差: 手写层没空时烘焙卡不进池;空了才全权
     if unseen_handwritten == 0:
@@ -167,7 +195,9 @@ def draw(
         for i, item in enumerate(baked.flora_items(place_name)):
             key = f"{place_name}/烘焙植被/{i}"
             if key not in seen:
-                pool.append(("植被", key, baked.render_flora(item, rng), 1.0))
+                rendered = baked.render_flora(item, rng)
+                if rendered is not None:
+                    pool.append(("植被", key, rendered, 1.0))
 
     # Card 12: intent bias for food
     if intent in ("吃", "美食", "食物"):

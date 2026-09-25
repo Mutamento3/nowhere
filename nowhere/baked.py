@@ -107,36 +107,45 @@ def food_items(country_code: str | None, lat: float = 0, lon: float = 0,
     items = _food.get(country_code, [])
     # 过滤掉 zh 为空的条目——英文菜名不该进中文散文
     items = [i for i in items if i.get("zh", "").strip()]
-    # 中国食物按地区过滤
+    _generic = [i for i in items if not i.get("region")]
+    # 中国食物按地区过滤; 区域判不出或该区域无条目时只回通用条目
+    # —— 回退全部条目会把川菜/东北菜放进华南场景(宁可少,不许错)
     if country_code == "CN" and lat != 0:
         region = _get_cn_region(lat, lon)
         if region:
             filtered = [i for i in items if i.get("region") == region]
             if filtered:
                 return filtered
-    # 区域过滤: 条目带 region 时,当前坐标的区域不匹配→跳过
-    # place_name 不在表里→region 卡不抽(宁可少,不许错)
+        return _generic
+    # 区域过滤: place_name 命中表时按区域收窄; 未命中=区域不可知,
+    # 同样只保留不带 region 的通用条目, 而不是把带 region 的外地条目
+    # 原样放回(在马德里抽出加泰罗尼亚菜正是要防的)
     if place_name:
         place_region = _PLACE_REGION.get(place_name)
         if place_region:
             filtered = [i for i in items if not i.get("region") or place_region in i["region"]]
             return filtered
+        return _generic
     return items
 
 
 def _get_cn_region(lat: float, lon: float) -> str:
-    """根据经纬度判断中国地区"""
-    regions = {
-        "东北": (40, 55, 120, 135),
-        "华北": (35, 45, 110, 120),
-        "华东": (25, 35, 115, 125),
-        "华南": (18, 25, 105, 120),
-        "华中": (25, 35, 105, 115),
-        "西北": (35, 50, 75, 110),
-        "西南": (18, 35, 85, 110),
-    }
-    for name, (lat_min, lat_max, lon_min, lon_max) in regions.items():
-        if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max:
+    """根据经纬度判断中国地区。
+
+    半开区间 [min, max) 消除边界双命中; 检查顺序即优先级(华南先于
+    西南保住广西, 西南先于华中保住重庆/贵阳), 区间间不再有面积重叠。
+    """
+    regions = [
+        ("东北", (40, 55, 120, 136)),
+        ("华北", (35, 45, 110, 120)),
+        ("华东", (25, 35, 115, 125)),
+        ("华南", (18, 25, 105, 121)),
+        ("西北", (35, 50, 75, 110)),
+        ("西南", (18, 35, 85, 110)),
+        ("华中", (25, 35, 110, 115)),
+    ]
+    for name, (lat_min, lat_max, lon_min, lon_max) in regions:
+        if lat_min <= lat < lat_max and lon_min <= lon < lon_max:
             return name
     return ""
 
@@ -151,8 +160,9 @@ def flora_items(place_name: str | None) -> list[dict]:
 def render_food(item: dict, rng: random.Random) -> str | None:
     name = _simp(item.get("zh") or item.get("en") or "")
 
-    # 外文名过滤: zh 空或纯 ASCII 名不进中文散文
-    if not name or _is_pure_ascii(name):
+    # 中文名过滤: 用 _has_cjk 与描述口径一致。纯 ASCII 判定拦不住带重音
+    # 的拉丁名(Crème Brûlée 的 é/û), 假名/西里尔名同理
+    if not name or not _has_cjk(name):
         return None
 
     # 1. Try scene file first (most specific)
@@ -160,10 +170,18 @@ def render_food(item: dict, rng: random.Random) -> str | None:
     if name in scenes:
         return f"{name}。{scenes[name]}"
 
-    # 2. Try partial match (e.g., "冬阴功汤" matches "冬阴功")
-    for scene_name, scene_desc in scenes.items():
-        if scene_name in name or name in scene_name:
-            return f"{name}。{scene_desc}"
+    # 2. Controlled prefix match, 取最长匹配。场景名是菜名的前缀
+    # ("冬阴功汤"→"冬阴功")或菜名是场景名的前缀("冬阴功"→"冬阴功汤");
+    # 单字通名("面"/"饼")不参与, 否则"汤面"会粘上"面"的文案
+    best_name = ""
+    for scene_name in scenes:
+        if len(scene_name) < 2:
+            continue
+        if name.startswith(scene_name) or scene_name.startswith(name):
+            if len(scene_name) > len(best_name):
+                best_name = scene_name
+    if best_name:
+        return f"{name}。{scenes[best_name]}"
 
     # 3. Fall back to existing template logic
     desc = (item.get("desc") or "").strip()
@@ -178,7 +196,14 @@ def render_food(item: dict, rng: random.Random) -> str | None:
     return None
 
 
-def render_flora(item: dict, rng: random.Random) -> str:
-    name = item.get("zh") or item.get("la") or ""
+def render_flora(item: dict, rng: random.Random) -> str | None:
+    """空名/纯外文名跳过(与 render_food 同规则, 但更直接: 不回落拉丁名)。
+
+    zh 缺失时回落拉丁学名会把 "Pinus tabuliformis" 混进中文散文;
+    zh 与 la 都缺时进模板会产出残句 —— 这两种都返回 None 不出卡。
+    """
+    name = _simp(item.get("zh") or "")
+    if not name or not _has_cjk(name):
+        return None
     tmpl = rng.choice(_FLORA_TEMPLATES)
     return tmpl.format(name=name)

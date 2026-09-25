@@ -7,6 +7,7 @@ JSON — no large file parsing, no third-party parser dependencies.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -94,11 +95,14 @@ def _load_local_kb() -> dict[str, dict]:
         data = json.loads(fp.read_text(encoding="utf-8"))
         _local_kb.update(data)
 
-    # Build first-character inverted index for substring lookups
+    # Build inverted index for substring lookups.
+    # 对 name 的所有字符建索引: 反向包含(title in name)的条目, 其首字符
+    # 未必出现在 title 里("熊猫" vs "大熊猫"), 只按 name[0] 建会静默漏配
     idx: dict[str, list[str]] = {}
     for name in _local_kb:
         if name:
-            idx.setdefault(name[0], []).append(name)
+            for ch in dict.fromkeys(name):
+                idx.setdefault(ch, []).append(name)
     _kb_char_index = idx
 
     # Load labels (卡88)
@@ -171,7 +175,7 @@ def _format_kb_entry(name: str, entry: dict | str) -> dict:
     }
 
 
-async def about(lat: float, lon: float, topic: str, rng: random.Random | None = None) -> dict | None:
+async def about(lat: float, lon: float, topic: str, rng: _random.Random | None = None) -> dict | None:
     """Return a knowledge result from the local KB, or *None*.
 
     Parameters
@@ -187,7 +191,8 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
         # BND-07: hash() of a str is per-process randomised — seed must be stable
         seed = int(hashlib.md5(f"{lat:.4f},{lon:.4f}|{topic}".encode("utf-8")).hexdigest(), 16)
         rng = _random.Random(seed)
-    kb = _load_local_kb()
+    # 首次调用含 JSON 解析, 放线程外避免阻塞事件循环
+    kb = await asyncio.to_thread(_load_local_kb)
 
     # ── 1. Exact match ──
     if title and title in kb:
@@ -200,15 +205,17 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
     _has_topic_word = any(tw in title for tw in _TOPIC_LABELS)
     if title and not _has_topic_word:
         idx = _kb_char_index or {}
+        # dict.fromkeys 保持 title 首现顺序, set 会随 PYTHONHASHSEED 漂移,
+        # 多条目同时满足时返回结果不可复现 (BND-07 要求确定性)
         # Forward: "故宫有什么" contains "故宫" → match
-        for ch in set(title):
+        for ch in dict.fromkeys(title):
             for name in idx.get(ch, []):
                 if name in title:
                     entry = kb.get(name)
                     if entry is not None:
                         return _format_kb_entry(name, entry)
         # Backward: "故宫" is substring of "故宫博物院"
-        for ch in set(title):
+        for ch in dict.fromkeys(title):
             for name in idx.get(ch, []):
                 if title in name:
                     entry = kb.get(name)
@@ -228,9 +235,10 @@ async def about(lat: float, lon: float, topic: str, rng: random.Random | None = 
     # ── 4. Topic word mapping (卡88) ──
     # "这里的美食" / "这里的历史" / "这里的寺庙"
     if title:
-        place_name = await _resolve_place_name(lat, lon)
         for topic_word, target_labels in _TOPIC_LABELS.items():
             if topic_word in title:
+                # place 解析含同步 IO, 只在真的含话题词时才付这个代价
+                place_name = await _resolve_place_name(lat, lon)
                 if place_name and _city_data:
                     # 1. Direct city match in ask_city.json
                     city_entry = _city_data.get(place_name)
@@ -272,12 +280,17 @@ async def _resolve_place_name(lat: float, lon: float) -> str:
     """Get the nearest named place for given coordinates (Chinese name优先)."""
     try:
         from nowhere import places
-        nearby = places.nearby(lat, lon, radius_km=20, limit=1)
-        if nearby:
-            name = nearby[0]["name"]
-            # Try to find Chinese name from places.db alts
-            zh = _get_chinese_name(name)
-            return zh or name
+
+        def _lookup() -> str:
+            # places.nearby 与 _get_chinese_name 都是同步 SQLite/文件扫描
+            nearby = places.nearby(lat, lon, radius_km=20, limit=1)
+            if nearby:
+                name = nearby[0]["name"]
+                zh = _get_chinese_name(name)
+                return zh or name
+            return ""
+
+        return await asyncio.to_thread(_lookup)
     except Exception as exc:
         logger.debug("places.nearby failed: %s", exc)
     return ""
@@ -325,12 +338,18 @@ _DISTANCING_LINES: list[str] = [
 ]
 
 
+# 转换器无状态可复用, 构造要加载词典, 惰性缓存一份
+_opencc_converter = None
+
+
 def _t2s(text: str) -> str:
     """Traditional to Simplified Chinese (opencc t2s)."""
+    global _opencc_converter
     try:
         import opencc
-        converter = opencc.OpenCC("t2s")
-        return converter.convert(text)
+        if _opencc_converter is None:
+            _opencc_converter = opencc.OpenCC("t2s")
+        return _opencc_converter.convert(text)
     except Exception:
         return text  # intentionally ignored: opencc optional
 
@@ -368,6 +387,9 @@ def voice_layer(text: str, rng: _random.Random | None = None) -> str:
     text = _truncate_at_boundary(text)
     if rng is None:
         rng = _random.Random()
+    # extract 未必以句号收尾, 直接拼接会产出"……当地用人民币这是书上说的。"
+    if text[-1] not in "。！？…":
+        text += "。"
     text += rng.choice(_DISTANCING_LINES)
     return text
 

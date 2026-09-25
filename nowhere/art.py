@@ -11,6 +11,7 @@ The unified Card schema in cards.py covers static card sources.
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json as _json
 import logging
@@ -33,7 +34,10 @@ def _load_art_db() -> dict:
         try:
             with gzip.open(_ART_DB_PATH, "rb") as f:
                 _ART_DB = _json.loads(f.read().decode("utf-8"))
-        except Exception:
+        except (OSError, EOFError, UnicodeDecodeError, _json.JSONDecodeError) as exc:
+            # BadGzipFile/truncation land in OSError/EOFError; leave the reasons in the logs,
+            # otherwise "data missing" and "no cultural match" are indistinguishable
+            logger.warning("art db load failed (%s): %s", _ART_DB_PATH, exc)
             _ART_DB = {"artworks": [], "by_culture": {}, "count": 0}
     return _ART_DB
 
@@ -54,12 +58,16 @@ _GEO_CULTURE: list[tuple[float, float, float, float, str]] = [
     # Middle East -- Iran, Iraq, Arabian Peninsula, Turkey
     (15, 42, 35, 65, "Middle Eastern"),
 
-    # East Asia
-    (20, 50, 100, 145, "Japanese"),
+    # East Asia -- specific first: Japan archipelago → Korean Peninsula → pan-China band.
+    # Japanese narrowed to lon>=129, otherwise it swallows East China/the Korean Peninsula/northern Vietnam;
+    # the Chinese band and Southeast Asian overlap in lat 18-25, with China taking priority (Hainan/Lingnan
+    # are judged as Chinese; the Hanoi area is a known tradeoff of the coarse-partition band)
+    (30, 46, 129, 146, "Japanese"),
     (33, 43, 124, 132, "Korean"),
     (18, 55, 73, 135, "Chinese"),
 
     # South Asia -- mainland + islands (Maldives, Sri Lanka, etc.)
+    # BEFORE Chinese: the two bands overlap at lon 73-100, India must match first
     (-10, 38, 60, 100, "South Asian"),
 
     # Southeast Asia
@@ -71,19 +79,20 @@ _GEO_CULTURE: list[tuple[float, float, float, float, str]] = [
     # Sub-Saharan Africa
     (-35, 15, -20, 55, "African"),
 
-    # Europe
-    (35, 72, -15, 40, "European"),
-    (35, 60, -10, 3, "Spanish"),
-    (36, 48, 6, 18, "Italian"),
-    (42, 52, -6, 10, "French"),
-    (47, 60, 5, 30, "German"),
+    # Europe -- countries first, "European" only as the catch-all for the rest of Europe;
+    # between Scandinavian and German, Scandinavian comes first to keep Denmark/southern Scandinavia reachable
     (50, 62, -10, 2, "British"),
     (55, 85, 5, 35, "Scandinavian"),
+    (47, 60, 5, 30, "German"),
+    (36, 48, 6, 18, "Italian"),
+    (42, 52, -6, 10, "French"),
+    (35, 60, -10, 3, "Spanish"),
+    (35, 72, -15, 40, "European"),
 
-    # Americas
+    # Americas -- Pre-Columbian before American (the two bands overlap, specific first)
+    (15, 33, -120, -85, "Pre-Columbian"),
     (10, 35, -130, -60, "American"),
     (-55, 10, -85, -35, "Latin American"),
-    (15, 33, -120, -85, "Pre-Columbian"),
 
     # Oceania
     (-50, -5, 110, 180, "Oceanic"),
@@ -124,6 +133,29 @@ _GEO_TO_MET_CULTURE: dict[str, list[str]] = {
     "Oceanic": ["maori", "kanak", "lapita", "polynesian", "melanesian",
                 "micronesian", "papua", "bornean", "balinese"],
 }
+
+
+def _culture_key_match(mk: str, ck: str) -> bool:
+    """映射键 mk → DB culture 键 ck 的锚定匹配(两侧均应为 lower)。
+
+    不用双向子串: "african"⊂"north african"、"american"⊂"latin american"
+    会把跨区作品误配进候选。DB 键的合法形态是 mk 加限定成分
+    ("german, augsburg"/"akan peoples"/"central asian or russian")、
+    or 复合主文化("tibetan or mongolian")或括号别名("mexica (aztec)")。
+    """
+    if mk == ck:
+        return True
+    # mk 后紧跟限定成分
+    if ck.startswith(mk + " ") or ck.startswith(mk + ",") or ck.startswith(mk + ";"):
+        return True
+    # or 复合主文化: 任一段等值即命中
+    if any(seg.strip().rstrip("(?)").strip() == mk for seg in ck.split(" or ")):
+        return True
+    # 括号别名
+    _head, lp, tail = ck.partition("(")
+    if lp and tail.rstrip(")").rstrip(" ?").strip() == mk:
+        return True
+    return False
 
 
 def _geo_culture(lat: float, lon: float) -> str | None:
@@ -206,9 +238,12 @@ def _local_art_match(lat: float, lon: float, mood: str, rng: random.Random) -> d
     for mk in met_keys:
         mk_lower = mk.lower()
         for ck, idxs in by_culture.items():
-            if mk_lower in ck or ck in mk_lower:
+            if _culture_key_match(mk_lower, ck.lower()):
                 matching_indices.extend(idxs)
-    candidates = [artworks[i] for i in matching_indices if i < len(artworks)]
+    # 同一索引会被多个 key 命中(如 china+chinese), 去重避免抽样过采样
+    candidates = [
+        artworks[i] for i in dict.fromkeys(matching_indices) if i < len(artworks)
+    ]
 
     if not candidates:
         logger.info("art_geo: region=%s met_keys=%s → 0 candidates", culture, met_keys)
@@ -217,7 +252,8 @@ def _local_art_match(lat: float, lon: float, mood: str, rng: random.Random) -> d
     # ── Step 3: pick from the culture-matched pool ───────────────────
     pool = candidates[:50]
     rng.shuffle(pool)
-    for art in pool[:5]:
+    # 遍历整个池: 前 5 条恰好都缺图缺标题时不应漏配 (候选都在内存)
+    for art in pool:
         if art.get("image") and art.get("title"):
             return {
                 "title": art["title"],
@@ -252,6 +288,8 @@ async def match(lat: float, lon: float, mood: str, rng: random.Random | None = N
         mood = "calm"
 
     # ── 1. Try local database first ─────────────────────────────────
+    # 首次 gzip 解压 + 全量 JSON 解析放到线程外, 避免阻塞事件循环
+    await asyncio.to_thread(_load_art_db)
     result = _local_art_match(lat, lon, mood, rng)
     if result:
         return result
@@ -299,9 +337,10 @@ async def _search_and_pick(search_term: str, mood: str, rng: random.Random) -> d
 
     # Pick from top 20 for variety
     object_ids: list[int] = search_data["objectIDs"][:20]
-    # Shuffle and try up to 5 (some entries have no image)
+    # Shuffle and try all of them (some entries have no image) -- a fixed
+    # first-5 cap would false-negative when those 5 all lack images
     rng.shuffle(object_ids)
-    for oid in object_ids[:5]:
+    for oid in object_ids:
         obj_url = (
             "https://collectionapi.metmuseum.org/public/collection/v1"
             f"/objects/{oid}"

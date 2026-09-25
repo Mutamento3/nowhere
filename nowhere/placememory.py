@@ -11,13 +11,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import tempfile
+import threading
 from pathlib import Path
 
 
 from nowhere.util import _get_home
+
+logger = logging.getLogger(__name__)
+
+# 模块内所有读-改-写共用的进程内锁: server 在多线程 HTTP 与后台线程里
+# 调用本模块, 无锁的 load→mutate→dump 会互相覆盖(丢失更新)
+_lock = threading.RLock()
 
 
 def _path(name: str) -> Path:
@@ -31,9 +39,9 @@ def _load(name: str) -> dict:
         return {}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        # ERR-05: a corrupt file must be preserved — the next save would
-        # otherwise overwrite it with {} and silently destroy the data.
+    except json.JSONDecodeError:
+        # ERR-05: 只有内容确实不可解析才改名备份。权限/瞬时 IO 的读取失败
+        # 时文件本身是好的, 改名后返回 {} 会让下一次 _dump 用空数据顶替。
         backup = p.with_name(p.name + ".corrupt")
         n = 0
         while backup.exists():
@@ -41,9 +49,12 @@ def _load(name: str) -> dict:
             backup = p.with_name(f"{p.name}.corrupt.{n}")
         try:
             p.replace(backup)
-        except OSError:
-            pass  # intentionally ignored: backup failure, still return empty
+            logger.warning("%s 损坏, 已备份为 %s", p.name, backup.name)
+        except OSError as exc:
+            logger.warning("%s 损坏且备份改名失败: %s", p.name, exc)
         return {}
+    # OSError(权限/EMFILE/瞬时 IO)向上抛: 调用方拿不到数据就不会触发
+    # 后续用空数据覆盖原文件的写入链路
 
 
 def _dump(name: str, data: dict) -> None:
@@ -51,13 +62,21 @@ def _dump(name: str, data: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+        try:
+            f = os.fdopen(tmp_fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(tmp_fd)  # fdopen 失败时 fd 未移交 with, 显式关闭防泄漏
+            raise
+        with f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, p)
     except BaseException:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass  # unlink 失败不许遮蔽原始异常
         raise
 
 
@@ -66,17 +85,19 @@ def seen_cards(place: str) -> set[str]:
 
 
 def save_seen_cards(place: str, cards: set[str]) -> None:
-    data = _load("seen_cards.json")
-    data[place] = sorted(cards)
-    _dump("seen_cards.json", data)
+    with _lock:
+        data = _load("seen_cards.json")
+        data[place] = sorted(cards)
+        _dump("seen_cards.json", data)
 
 
 def record_visit(place: str) -> int:
     """记一次到访,返回这是第几次。"""
-    data = _load("visits.json")
-    data[place] = data.get(place, 0) + 1
-    _dump("visits.json", data)
-    return data[place]
+    with _lock:
+        data = _load("visits.json")
+        data[place] = data.get(place, 0) + 1
+        _dump("visits.json", data)
+        return data[place]
 
 
 def record_landing(
@@ -89,19 +110,20 @@ def record_landing(
     """落点编录: 地名+坐标+次数+最近一次+地貌(地图画地形符号用)。返回第几次来。"""
     from datetime import datetime, timezone
 
-    data = _load("landings.json")
-    entry = data.get(place, {"lat": round(lat, 4), "lon": round(lon, 4), "count": 0})
-    entry["count"] = int(entry.get("count", 0)) + 1
-    entry["lat"] = round(lat, 4)
-    entry["lon"] = round(lon, 4)
-    if elevation is not None:
-        entry["elevation"] = round(elevation)
-    if surface:
-        entry["surface"] = surface
-    entry["last"] = datetime.now(timezone.utc).isoformat()
-    data[place] = entry
-    _dump("landings.json", data)
-    return entry["count"]
+    with _lock:
+        data = _load("landings.json")
+        entry = data.get(place, {"lat": round(lat, 4), "lon": round(lon, 4), "count": 0})
+        entry["count"] = int(entry.get("count", 0)) + 1
+        entry["lat"] = round(lat, 4)
+        entry["lon"] = round(lon, 4)
+        if elevation is not None:
+            entry["elevation"] = round(elevation)
+        if surface:
+            entry["surface"] = surface
+        entry["last"] = datetime.now(timezone.utc).isoformat()
+        data[place] = entry
+        _dump("landings.json", data)
+        return entry["count"]
 
 
 def landings() -> list[dict]:
@@ -124,20 +146,21 @@ def record_sighting(
     """动物目击编录: 谁/在哪/多远/哪天/来源。上限 200 条。"""
     from datetime import datetime, timezone
 
-    data = _load("sightings.json")
-    items = data.get("items", [])
-    items.append({
-        "name": name,
-        "common_name": common_name,
-        "lat": round(lat, 4),
-        "lon": round(lon, 4),
-        "distance_m": distance_m,
-        "seen_at": seen_at,
-        "source": source,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    })
-    data["items"] = items[-200:]
-    _dump("sightings.json", data)
+    with _lock:
+        data = _load("sightings.json")
+        items = data.get("items", [])
+        items.append({
+            "name": name,
+            "common_name": common_name,
+            "lat": round(lat, 4),
+            "lon": round(lon, 4),
+            "distance_m": distance_m,
+            "seen_at": seen_at,
+            "source": source,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+        data["items"] = items[-200:]
+        _dump("sightings.json", data)
 
 
 def sightings() -> list[dict]:
@@ -159,17 +182,19 @@ def get_total_distance_km() -> float:
 
 
 def add_distance_km(km: float) -> float:
-    """Add km to the global odometer. Returns new total."""
-    data = _load("odometer.json")
-    total = float(data.get("total_km", 0.0)) + km
-    data["total_km"] = round(total, 3)
-    _dump("odometer.json", data)
-    return total
+    """Add km to the global odometer. Returns new total (与落盘值一致)."""
+    with _lock:
+        data = _load("odometer.json")
+        total = round(float(data.get("total_km", 0.0)) + km, 3)
+        data["total_km"] = total
+        _dump("odometer.json", data)
+        return total
 
 
 def save_seen_humanities(keys: set[str]) -> None:
     """Persist the global set of seen humanities card keys."""
-    _dump("seen_humanities.json", {"keys": sorted(keys)})
+    with _lock:
+        _dump("seen_humanities.json", {"keys": sorted(keys)})
 
 
 # ── Card 16: revealed places (global, across journeys) ─────────────
@@ -182,9 +207,10 @@ def revealed_places() -> set[str]:
 
 def save_revealed_place(place: str) -> None:
     """Record a place as revealed from blind mode."""
-    places = revealed_places()
-    places.add(place)
-    _dump("revealed_places.json", {"places": sorted(places)})
+    with _lock:
+        places = revealed_places()
+        places.add(place)
+        _dump("revealed_places.json", {"places": sorted(places)})
 
 
 # ── 明信片落盘: 文件是真相,谁寄的网页都看得见 ─────────────────────
@@ -195,36 +221,39 @@ _FOOTPRINTS_CAP = 200
 
 def save_postcard(card: dict) -> None:
     """寄出即落盘。跨进程跨会话,墙不空。"""
-    data = _load("postcards.json")
-    items = data.get("items", [])
-    items.append(card)
-    data["items"] = items[-_POSTCARDS_CAP:]
-    _dump("postcards.json", data)
+    with _lock:
+        data = _load("postcards.json")
+        items = data.get("items", [])
+        items.append(card)
+        data["items"] = items[-_POSTCARDS_CAP:]
+        _dump("postcards.json", data)
 
 
 def update_postcard(card: dict) -> None:
     """卡内容变了(正面图生成好了)就回写。"""
-    data = _load("postcards.json")
-    items = data.get("items", [])
-    for i, c in enumerate(items):
-        if c.get("id") == card.get("id"):
-            items[i] = card
-            break
-    data["items"] = items
-    _dump("postcards.json", data)
+    with _lock:
+        data = _load("postcards.json")
+        items = data.get("items", [])
+        for i, c in enumerate(items):
+            if c.get("id") == card.get("id"):
+                items[i] = card
+                break
+        data["items"] = items
+        _dump("postcards.json", data)
 
 
 def add_postcard_reply(card_id: int, content: str) -> bool:
     """人回一句,落盘。卡在不在文件里,不在就 False。"""
-    data = _load("postcards.json")
-    items = data.get("items", [])
-    for c in items:
-        if c.get("id") == card_id:
-            c.setdefault("replies", []).append(content)
-            data["items"] = items
-            _dump("postcards.json", data)
-            return True
-    return False
+    with _lock:
+        data = _load("postcards.json")
+        items = data.get("items", [])
+        for c in items:
+            if c.get("id") == card_id:
+                c.setdefault("replies", []).append(content)
+                data["items"] = items
+                _dump("postcards.json", data)
+                return True
+        return False
 
 
 def postcards() -> list[dict]:
@@ -234,27 +263,28 @@ def postcards() -> list[dict]:
         state_file = _path("state.json")
         if state_file.exists():
             try:
-                import json as _json
-
-                old = _json.loads(state_file.read_text(encoding="utf-8"))
+                old = json.loads(state_file.read_text(encoding="utf-8"))
                 items = old.get("postcards", [])
                 if items:
-                    _dump("postcards.json", {"items": items[-_POSTCARDS_CAP:]})
-            except (OSError, _json.JSONDecodeError):
+                    # 返回值与落盘保持同一份裁剪结果, 边界行为稳定
+                    items = items[-_POSTCARDS_CAP:]
+                    _dump("postcards.json", {"items": items})
+            except (OSError, json.JSONDecodeError):
                 pass
     return list(reversed(items))
 
 
 def delete_postcard(card_id: int) -> bool:
     """撕掉一张。测试卡、废卡,别留在墙上。"""
-    data = _load("postcards.json")
-    items = data.get("items", [])
-    keep = [c for c in items if c.get("id") != card_id]
-    if len(keep) == len(items):
-        return False
-    data["items"] = keep
-    _dump("postcards.json", data)
-    return True
+    with _lock:
+        data = _load("postcards.json")
+        items = data.get("items", [])
+        keep = [c for c in items if c.get("id") != card_id]
+        if len(keep) == len(items):
+            return False
+        data["items"] = keep
+        _dump("postcards.json", data)
+        return True
 
 
 # ── 旅行足迹 ──────────────────────────────────────────────
@@ -271,30 +301,31 @@ def record_footprint(
     """持久化一次旅行行动，时间为现实 UTC。"""
     from datetime import datetime, timezone
 
-    data = _load("footprints.json")
-    items = data.get("items", [])
-    item = {
-        "action": action,
-        "text": text,
-        "lat": round(lat, 4),
-        "lon": round(lon, 4),
-        "place": place or "",
-        "at": datetime.now(timezone.utc).isoformat(),
-    }
-    clean_stream_url = str(stream_url or "").strip()
-    if clean_stream_url.startswith(("http://", "https://")):
-        item["stream_url"] = clean_stream_url
-    if station:
-        public_station = {
-            key: station[key]
-            for key in ("name", "genre", "country")
-            if station.get(key) not in (None, "")
+    with _lock:
+        data = _load("footprints.json")
+        items = data.get("items", [])
+        item = {
+            "action": action,
+            "text": text,
+            "lat": round(lat, 4),
+            "lon": round(lon, 4),
+            "place": place or "",
+            "at": datetime.now(timezone.utc).isoformat(),
         }
-        if public_station:
-            item["station"] = public_station
-    items.append(item)
-    data["items"] = items[-_FOOTPRINTS_CAP:]
-    _dump("footprints.json", data)
+        clean_stream_url = str(stream_url or "").strip()
+        if clean_stream_url.startswith(("http://", "https://")):
+            item["stream_url"] = clean_stream_url
+        if station:
+            public_station = {
+                key: station[key]
+                for key in ("name", "genre", "country")
+                if station.get(key) not in (None, "")
+            }
+            if public_station:
+                item["station"] = public_station
+        items.append(item)
+        data["items"] = items[-_FOOTPRINTS_CAP:]
+        _dump("footprints.json", data)
 
 
 def footprints() -> list[dict]:
@@ -309,11 +340,12 @@ _BURIED_CAP = 100
 
 def save_buried(entry: dict) -> None:
     """埋一件东西。FIFO 100 上限。"""
-    data = _load("buried.json")
-    items = data.get("items", [])
-    items.append(entry)
-    data["items"] = items[-_BURIED_CAP:]
-    _dump("buried.json", data)
+    with _lock:
+        data = _load("buried.json")
+        items = data.get("items", [])
+        items.append(entry)
+        data["items"] = items[-_BURIED_CAP:]
+        _dump("buried.json", data)
 
 
 def buried_items() -> list[dict]:
@@ -346,17 +378,24 @@ def buried_nearby(lat: float, lon: float, radius_km: float = 3.0) -> list[dict]:
 
 def journey_footprints() -> list[dict]:
     """返回已记录行动，并诚实补充旧数据中可确认的旅程证据。"""
+    from datetime import datetime, timezone
+
     items = footprints()
 
     for card in postcards():
         if card.get("sent_at"):
             continue
         stamp = card.get("stamp") or {}
+        lat = stamp.get("lat")
+        lon = stamp.get("lon")
+        if lat is None or lon is None:
+            # legacy 条目缺坐标: 下游按 float 使用(画地图/算距离)会炸, 显式跳过
+            continue
         items.append({
             "action": "postcard",
             "text": card.get("text", ""),
-            "lat": stamp.get("lat"),
-            "lon": stamp.get("lon"),
+            "lat": lat,
+            "lon": lon,
             "place": stamp.get("place", ""),
             "at": None,
             "journey_at": stamp.get("local_time", ""),
@@ -375,7 +414,20 @@ def journey_footprints() -> list[dict]:
             "legacy": True,
         })
 
-    items.sort(key=lambda item: item.get("at") or item.get("journey_at") or "", reverse=True)
+    def _ts(item: dict) -> float:
+        # 足迹的 at 是 UTC ISO; legacy journey_at 是无时区的本地时间串,
+        # 字典序比较得不到正确时间顺序 → 统一解析成时间戳再排
+        raw = item.get("at") or item.get("journey_at") or ""
+        try:
+            dt = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            return 0.0
+        if dt.tzinfo is None:
+            # legacy 本地串无时区信息, 按 UTC 折算只为可比较
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+        return dt.timestamp()
+
+    items.sort(key=_ts, reverse=True)
     return items
 
 
@@ -426,18 +478,24 @@ def advance_trace_stage(place: str) -> int:
 def get_trace_text(place: str) -> str | None:
     """Get the trace text for the current stage of a place.
 
-    Returns the text and advances the stage.
-    Returns None if the place has no trace chain.
+    Returns the text and advances the stage. 读取当前阶段与推进合并为
+    单次加锁的 load→compute→dump: 拆成两步时并发线程会都读到 current=N
+    再各写回 N+1, 推进丢失或重复消费。
     """
     traces = _load_traces()
-    if place not in traces:
+    entry = traces.get(place)
+    if not isinstance(entry, dict) or not entry.get("stages"):
+        # 缺 stages 键或空列表: 防御 IndexError/KeyError, 无链可放 → None
         return None
-    stage = get_trace_stage(place)
-    stages = traces[place]["stages"]
-    if stage >= len(stages):
-        stage = len(stages) - 1
-    text = stages[stage]
-    advance_trace_stage(place)
+    stages = entry["stages"]
+    with _lock:
+        data = _load("trace_stages.json")
+        stage = int(data.get(place, 0))
+        if stage >= len(stages):
+            stage = len(stages) - 1
+        text = stages[stage]
+        data[place] = min(stage + 1, len(stages) - 1)
+        _dump("trace_stages.json", data)
     return text
 
 
@@ -454,15 +512,16 @@ _LOST_SOUVENIRS_CAP = 50
 def record_lost_souvenir(name: str, place: str) -> None:
     """Record a lost souvenir. Card 50: some things lost are lost."""
     from datetime import datetime, timezone
-    data = _load("lost_souvenirs.json")
-    items = data.get("items", [])
-    items.append({
-        "name": name,
-        "place": place,
-        "lost_at": datetime.now(timezone.utc).isoformat(),
-    })
-    data["items"] = items[-_LOST_SOUVENIRS_CAP:]
-    _dump("lost_souvenirs.json", data)
+    with _lock:
+        data = _load("lost_souvenirs.json")
+        items = data.get("items", [])
+        items.append({
+            "name": name,
+            "place": place,
+            "lost_at": datetime.now(timezone.utc).isoformat(),
+        })
+        data["items"] = items[-_LOST_SOUVENIRS_CAP:]
+        _dump("lost_souvenirs.json", data)
 
 
 def lost_souvenirs() -> list[dict]:

@@ -9,10 +9,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
+import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# 共享 JSON 的 load→mutate→save 序列全部经此锁: 调用方既有异步 HTTP 入口
+# 又有后台线程, 无锁时后写者会整体覆盖先写者的更新(丢失更新)
+_io_lock = threading.RLock()
 
 
 # ── Master switch ──────────────────────────────────────────────────────
@@ -44,17 +53,49 @@ def _messages_path() -> Path:
 
 
 def _load_json(path: Path) -> dict:
+    """读取共享 JSON。损坏时备份留证并抛错, 不静默返回 {}。
+
+    空 dict 会被调用方增量修改后整体写回 —— 一次读坏等于整个注册表/
+    脚印/留言被静默清空, 这比读失败本身严重得多。
+    """
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        backup = path.with_name(f"{path.name}.corrupt_{datetime.now():%Y%m%d_%H%M%S}")
+        try:
+            path.replace(backup)
+            logger.warning("%s 损坏, 已备份为 %s", path.name, backup.name)
+        except OSError as backup_exc:
+            logger.warning("%s 损坏且备份改名失败: %s", path.name, backup_exc)
+        raise ValueError(f"{path.name} 损坏, 拒绝以空数据覆盖: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} 顶层不是 dict")
+    return data
 
 
 def _save_json(path: Path, data: dict) -> None:
+    """同目录临时文件 + os.replace 原子替换, 不给"中途崩溃制造损坏档"留口。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)  # fdopen 失败时 fd 未移交 with, 显式关闭防泄漏
+            raise
+        with f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=1))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass  # 清理失败不许遮蔽原始异常
+        raise
 
 
 # ── Registry: register / refresh / expire ─────────────────────────────
@@ -66,52 +107,61 @@ def register(name: str, place: str, lat: float, lon: float) -> None:
     """Register or refresh a traveler on open_door."""
     if not is_enabled():
         return
-    data = _load_json(_travelers_path())
-    entry = data.get(name, {})
-    entry["place"] = place
-    entry["pos"] = [round(lat, 4), round(lon, 4)]
-    entry["last_seen"] = datetime.now(timezone.utc).isoformat()
-    entry["door_count"] = int(entry.get("door_count", 0)) + 1
-    data[name] = entry
-    _save_json(_travelers_path(), data)
+    with _io_lock:
+        data = _load_json(_travelers_path())
+        entry = data.get(name, {})
+        entry["place"] = place
+        entry["pos"] = [round(lat, 4), round(lon, 4)]
+        entry["last_seen"] = datetime.now(timezone.utc).isoformat()
+        entry["door_count"] = int(entry.get("door_count", 0)) + 1
+        data[name] = entry
+        # 互斥不变量: 过期归档后再次注册 = 复活, 必须从归档移除,
+        # 否则同一人两处并存, 会被按过去式渲染成旧脚印
+        archive = _load_json(_archive_path())
+        if name in archive:
+            archive.pop(name)
+            _save_json(_archive_path(), archive)
+        _save_json(_travelers_path(), data)
 
 
 def refresh_pos(name: str, lat: float, lon: float) -> None:
     """Update position (called every 5 walk steps)."""
     if not is_enabled():
         return
-    data = _load_json(_travelers_path())
-    if name in data:
-        data[name]["pos"] = [round(lat, 4), round(lon, 4)]
-        data[name]["last_seen"] = datetime.now(timezone.utc).isoformat()
-        _save_json(_travelers_path(), data)
+    with _io_lock:
+        data = _load_json(_travelers_path())
+        if name in data:
+            data[name]["pos"] = [round(lat, 4), round(lon, 4)]
+            data[name]["last_seen"] = datetime.now(timezone.utc).isoformat()
+            _save_json(_travelers_path(), data)
 
 
 def expire_inactive() -> None:
     """Move travelers inactive for 7+ days to archive."""
     if not is_enabled():
         return
-    data = _load_json(_travelers_path())
-    archive = _load_json(_archive_path())
-    cutoff = datetime.now(timezone.utc) - timedelta(days=_ARCHIVE_DAYS)
-    to_archive = []
-    for name, entry in data.items():
-        last = entry.get("last_seen", "")
-        if last:
-            try:
-                dt = datetime.fromisoformat(last)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                if dt < cutoff:
-                    to_archive.append(name)
-            except (ValueError, TypeError):
-                pass
-    for name in to_archive:
-        archive[name] = data.pop(name)
-        archive[name]["archived"] = True
-    if to_archive:
-        _save_json(_travelers_path(), data)
-        _save_json(_archive_path(), archive)
+    with _io_lock:
+        data = _load_json(_travelers_path())
+        archive = _load_json(_archive_path())
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_ARCHIVE_DAYS)
+        to_archive = []
+        for name, entry in data.items():
+            last = entry.get("last_seen", "")
+            if last:
+                try:
+                    dt = datetime.fromisoformat(last)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt < cutoff:
+                        to_archive.append(name)
+                except (ValueError, TypeError):
+                    pass
+        for name in to_archive:
+            archive[name] = data.pop(name)
+            archive[name]["archived"] = True
+        if to_archive:
+            _save_json(_travelers_path(), data)
+            _save_json(_archive_path(), archive)
 
 
 def get_active_travelers() -> dict[str, dict]:
@@ -138,21 +188,14 @@ def _km(a: tuple[float, float], b: tuple[float, float]) -> float:
     return 6371.0 * math.sqrt(dlat * dlat + dlon * dlon)
 
 
-def _bearing_word(from_pos: tuple[float, float], to_pos: tuple[float, float]) -> str:
-    """Return a Chinese compass direction from one pos toward another."""
-    lat1, lon1 = math.radians(from_pos[0]), math.radians(from_pos[1])
-    lat2, lon2 = math.radians(to_pos[0]), math.radians(to_pos[1])
-    dlon = lon2 - lon1
-    x = math.sin(dlon) * math.cos(lat2)
-    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
-    bearing = (math.degrees(math.atan2(x, y)) + 360) % 360
+def _bearing_word(bearing_deg: float) -> str:
+    """Return the Chinese compass word for a bearing in degrees."""
     dirs = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
-    return dirs[int((bearing + 22.5) / 45) % 8]
+    return dirs[int((bearing_deg + 22.5) / 45) % 8]
 
 
 # ── Footprint tracking ────────────────────────────────────────────────
 
-_FOOTPRINT_RECORDS_KEY = "records"
 _FOOTPRINT_MAX = 500
 
 
@@ -160,30 +203,34 @@ def record_footprint(name: str, lat: float, lon: float, place: str) -> None:
     """Record a footprint entry for a traveler (called on walk)."""
     if not is_enabled():
         return
-    data = _load_json(_travelers_path())
-    if name not in data:
-        return
-    fp_key = "footprints"
-    fps = data[name].setdefault(fp_key, [])
-    # Compute bearing from last footprint if exists
-    bearing = None
-    if fps:
-        last = fps[-1]
-        prev_pos = (last["lat"], last["lon"])
-        curr_pos = (lat, lon)
-        dlat = curr_pos[0] - prev_pos[0]
-        dlon = curr_pos[1] - prev_pos[1]
-        if abs(dlat) > 0.0001 or abs(dlon) > 0.0001:
-            bearing = math.degrees(math.atan2(dlon, dlat)) % 360
-    fps.append({
-        "lat": round(lat, 4),
-        "lon": round(lon, 4),
-        "place": place,
-        "at": datetime.now(timezone.utc).isoformat(),
-        "bearing": round(bearing, 1) if bearing is not None else None,
-    })
-    data[name][fp_key] = fps[-_FOOTPRINT_MAX:]
-    _save_json(_travelers_path(), data)
+    with _io_lock:
+        data = _load_json(_travelers_path())
+        if name not in data:
+            return
+        fp_key = "footprints"
+        fps = data[name].setdefault(fp_key, [])
+        # Compute bearing from last footprint if exists
+        bearing = None
+        if fps:
+            last = fps[-1]
+            prev_pos = (last["lat"], last["lon"])
+            curr_pos = (lat, lon)
+            dlat = curr_pos[0] - prev_pos[0]
+            dlon = curr_pos[1] - prev_pos[1]
+            if abs(dlat) > 0.0001 or abs(dlon) > 0.0001:
+                # 方位角: dlon 须按 cos(平均纬度) 收缩, 否则纬度越高
+                # 东西向的方位偏差越大(与 _km 的口径一致)
+                mean_lat = math.radians((curr_pos[0] + prev_pos[0]) / 2)
+                bearing = math.degrees(math.atan2(dlon * math.cos(mean_lat), dlat)) % 360
+        fps.append({
+            "lat": round(lat, 4),
+            "lon": round(lon, 4),
+            "place": place,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "bearing": round(bearing, 1) if bearing is not None else None,
+        })
+        data[name][fp_key] = fps[-_FOOTPRINT_MAX:]
+        _save_json(_travelers_path(), data)
 
 
 def check_footprints(
@@ -253,14 +300,12 @@ def check_footprints(
 
     # Determine surface from current environment (caller provides)
     bearing = fp.get("bearing")
-    bearing_word = ""
-    if bearing is not None:
-        dirs = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
-        bearing_word = dirs[int((bearing + 22.5) / 45) % 8]
+    bearing_word = _bearing_word(bearing) if bearing is not None else ""
 
-    # Check if archived (past tense)
-    archive = _load_json(_archive_path())
-    is_archived = other_name in archive
+    # Check if archived (past tense) — 活跃优先: 复活后的旅者会同时出现在
+    # 两张表里(register 已改为从归档移除, 这里再兜一层), 以活跃表为准,
+    # 不把还在走的旅者渲染成过去式
+    is_archived = other_name in archive and other_name not in data
 
     if count >= 3:
         if is_archived:
@@ -418,15 +463,16 @@ def send_at_message(from_name: str, to_name: str, place: str) -> None:
     """Queue a @name message for delivery on recipient's next open_door."""
     if not is_enabled():
         return
-    data = _load_json(_messages_path())
-    msgs = data.get(to_name, [])
-    msgs.append({
-        "from": from_name,
-        "place": place,
-        "at": datetime.now(timezone.utc).isoformat(),
-    })
-    data[to_name] = msgs[-50:]
-    _save_json(_messages_path(), data)
+    with _io_lock:
+        data = _load_json(_messages_path())
+        msgs = data.get(to_name, [])
+        msgs.append({
+            "from": from_name,
+            "place": place,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        data[to_name] = msgs[-50:]
+        _save_json(_messages_path(), data)
 
 
 def check_at_messages(name: str, rng) -> str | None:
@@ -436,14 +482,15 @@ def check_at_messages(name: str, rng) -> str | None:
     """
     if not is_enabled():
         return None
-    data = _load_json(_messages_path())
-    msgs = data.get(name, [])
-    if not msgs:
-        return None
-    # Consume one
-    msg = msgs.pop(0)
-    data[name] = msgs
-    _save_json(_messages_path(), data)
+    with _io_lock:
+        data = _load_json(_messages_path())
+        msgs = data.get(name, [])
+        if not msgs:
+            return None
+        # Consume one
+        msg = msgs.pop(0)
+        data[name] = msgs
+        _save_json(_messages_path(), data)
     place = msg.get("place", "某个地方")
     return rng.choice(_AT_HINT_VARIANTS).format(place=place)
 

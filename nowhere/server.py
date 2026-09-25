@@ -67,7 +67,7 @@ from nowhere import (
 )
 from nowhere.actions import ACTIONS, POST_NORMALIZE_ACTIONS, PRE_NORMALIZE_ACTIONS, WalkContext
 
-# ── Card 46: 六根时间轴 ────────────────────────────────────────────
+# ── Card 46: 六根时间车────────────────────────────────────────────
 import json as _json
 import pathlib as _pathlib
 from datetime import date as _date
@@ -82,13 +82,13 @@ mcp = FastMCP("nowhere")
 # ── Module-level state ───────────────────────────────────────────────
 
 _state: state_mod.WorldState = state_mod.WorldState()
-_door_lock = asyncio.Lock()  # open_door 竞态保护:一次只开一扇门
+_door_lock = asyncio.Lock()  # open_door 竞态保把一次只开一扇门
 _action_lock = asyncio.Lock()  # serialize mutations of the shared journey state
 _postcard_counter: int = 0  # 跨门的明信片编号,不走 state 重置
 _rng: random.Random = (
     random.Random(int(os.environ["NOWHERE_SEED"]))
     if os.environ.get("NOWHERE_SEED")
-    else random.Random()  # 生产真随机;测试用 NOWHERE_SEED 锁
+    else random.Random()  # 生产真随有测试用NOWHERE_SEED 锅
 )
 _web_port: int | None = None  # reserved for Task 11
 _web_url: str | None = None  # resolved public URL (env / LAN / localhost)
@@ -143,7 +143,7 @@ _HINT_LINES: list[str] = [
     "给门起个名字,它就记得你。同一个名字,永远是同一扇门。",
     "想再看一座城,就再开一次门。地名后加个\"新\",城会重新长。",
 ]
-_hint_counter: int = 0  # 轮换提示句
+_hint_counter: int = 0  # 轮换提示口
 _recent_salience_kinds: set[str] = set()  # Bug 4: track recent salience kinds
 _cotraveler_encounter_counts: dict[str, int] = {}  # how many times we've seen each traveler's footprints
 _cotraveler_meeting_log: dict[str, str] = {}  # pair_key -> last meeting ISO timestamp
@@ -158,13 +158,21 @@ def _serialized_action(func):
     return wrapped
 
 
+async def _run_serialized(func, /, *args: Any, **kwargs: Any) -> dict:
+    """同步变更实现走同一把 _action_lock: FastMCP 把同步工具丢进工作线程、
+    web handler 在事件循环里直呼实现, 二者与持锁协程交错时 check-then-act
+    会互相覆盖 —— 所有变更状态的工具都必须经此序列化。"""
+    async with _action_lock:
+        return func(*args, **kwargs)
+
+
 # =====================================================================
 # Card 46: 六根时间轴 — helpers
 # =====================================================================
 
 _TIMEAXES_DATA_DIR = _pathlib.Path(__file__).resolve().parent / "data"
 
-# Priority: 节日 > 纪念日 > 天象 > 物候/生物钟 > 周律 > 默认
+# Priority: 节日 > 纪念日> 天象 > 物候生物钟> 周律 > 默认
 _TP_FESTIVAL = 5
 _TP_ANNIVERSARY = 4
 _TP_METEOR = 3
@@ -217,6 +225,8 @@ def _load_mishaps() -> list[dict]:
 
 # ── Mishap cooldown tracking (per-journey, not serialized) ─────────
 _mishap_last_step: int = -999  # step counter of last mishap
+# 单次回声契约: 每个 mishap 的echo 只放行一次 None 表示当前无已回声的mishap
+_mishap_echoed_id: str | None = None
 _MISHAP_COOLDOWN: int = 10  # minimum steps between mishaps
 _MISHAP_CHANCE: float = 0.03  # 3% per walk step
 _MISHAP_ECHO_CHANCE: float = 0.50  # 50% next step has echo
@@ -285,15 +295,23 @@ def _try_mishap(env: dict, rng: random.Random) -> dict | None:
 
 
 def _try_mishap_echo(rng: random.Random) -> str | None:
-    """50% chance to return an echo from the last mishap."""
+    """50% chance to return an echo from the last mishap.
+
+    每个 mishap 的echo 只回响一次 已放行过的mishap id 记在
+    _mishap_echoed_id, 换新 mishap 前不再放街 避免同一口echo 刷屏。"
+    """
+    global _mishap_echoed_id
     if not _state.mishap_seen:
-        return None
-    if rng.random() > _MISHAP_ECHO_CHANCE:
         return None
     # Find the last mishap and return its echo
     last_id = _state.mishap_seen[-1]
+    if last_id == _mishap_echoed_id:
+        return None
+    if rng.random() > _MISHAP_ECHO_CHANCE:
+        return None
     for m in _load_mishaps():
         if m["id"] == last_id:
+            _mishap_echoed_id = last_id
             return m.get("echo")
     return None
 
@@ -351,7 +369,6 @@ def _check_meteor_shower(dt: datetime, weather_precip: str, phase: str,
     data = _load_meteor_showers()
     showers = data.get("showers", [])
     local_d = dt.astimezone(ZoneInfo("Asia/Shanghai")).date()
-    month_day = local_d.strftime("%m-%d")
 
     for s in showers:
         peak = s.get("peak_date", "")
@@ -359,19 +376,31 @@ def _check_meteor_shower(dt: datetime, weather_precip: str, phase: str,
         if not peak:
             continue
         try:
-            peak_dt = _date(local_d.year, int(peak[:2]), int(peak[3:5]))
+            peak_month, peak_day = int(peak[:2]), int(peak[3:5])
         except (ValueError, IndexError):
             continue  # intentionally ignored: malformed meteor shower peak date
-        diff = abs((local_d - peak_dt).days)
-        if diff <= days:
-            is_peak = diff == 0
-            return {
-                "name": s["name"],
-                "ZHR": s.get("ZHR", "中"),
-                "is_peak": is_peak,
-                "constellation": s.get("constellation", ""),
-                "hemisphere": s.get("hemisphere", "both"),
-            }
+        # 跨年: 12 月下旬的极大对次年1 月初的观海或反后也要算上,
+        # 只拼观测年份会漏掉整个窗口
+        best_diff: int | None = None
+        is_peak = False
+        for year in (local_d.year - 1, local_d.year, local_d.year + 1):
+            try:
+                peak_dt = _date(year, peak_month, peak_day)
+            except ValueError:
+                continue
+            diff = abs((local_d - peak_dt).days)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                is_peak = local_d == peak_dt
+        if best_diff is None or best_diff > days:
+            continue
+        return {
+            "name": s["name"],
+            "ZHR": s.get("ZHR", "中"),
+            "is_peak": is_peak,
+            "constellation": s.get("constellation", ""),
+            "hemisphere": s.get("hemisphere", "both"),
+        }
     return None
 
 
@@ -415,14 +444,14 @@ def _get_climate_zone(lat: float, elev: float = 0) -> str:
     Rules:
         elev >= 3000  -> 寒带（高原：拉萨/珠峰/西宁等）
         |lat| < 23.5  -> 热带
-        23.5 <= |lat| < 40  -> 暖温带
+        23.5 <= |lat| < 40  -> 暖温市
         40 <= |lat| < 60  -> 温带
         |lat| >= 60  -> 寒带
     """
     # High altitude override: force cold zone
     if elev >= 3000:
         if abs(lat) < 23.5:
-            return "暖温带"   # tropical high mountains drop one band
+            return "暖温带"  # tropical high mountains drop one band
         return "寒带"
     abs_lat = abs(lat)
     for lo, hi, zone in _CLIMATE_ZONES:
@@ -481,7 +510,7 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
         lb = cons.get("lat_band")
         if lb and not (lb[0] <= abs_lat < lb[1]):
             continue
-        # Card 73: ocean region constraint — typhoon cards only for coast/island/water
+        # Card 73: ocean region constraint  typhoon cards only for coast/island/water
         oc = cons.get("ocean")
         if oc:
             if biome not in ("coast", "island", "water"):
@@ -491,26 +520,26 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
                 cc_now = country.country_code_of(lat, lon)
                 if cc_now not in ccs:
                     continue
-        # Card 80: humidity bidirectional filter — arid cards only for desert or arid countries
+        # Card 80: humidity bidirectional filter  arid cards only for desert or arid countries
         _h = cons.get("humidity")
         if _h == "arid" and biome != "desert":
             cc_chk = country.country_code_of(lat, lon)
             if cc_chk not in _ARID_COUNTRIES_FULL:
                 continue
-        # Card 81: max_elev — skip tree/forest cards above treeline
+        # Card 81: max_elev  skip tree/forest cards above treeline
         me = cons.get("max_elev")
         if me and elev and elev > me:
             continue
-        # Card 75: coast_only — skip coastal cards for inland biomes
+        # Card 75: coast_only  skip coastal cards for inland biomes
         if cons.get("coast_only") and biome not in ("coast", "island", "water"):
             continue
-        # Card 84: hemisphere constraint — skip north-only cards in southern latitudes
+        # Card 84: hemisphere constraint  skip north-only cards in southern latitudes
         hemi = cons.get("hemisphere")
         if hemi == "north" and lat < 0:
             continue
         if hemi == "south" and lat > 0:
             continue
-        # Card 85: lat_min — skip polar day/night cards below minimum latitude
+        # Card 85: lat_min  skip polar day/night cards below minimum latitude
         lat_min = cons.get("lat_min")
         if lat_min and abs_lat < lat_min:
             continue
@@ -533,11 +562,11 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
                     cc_now = country.country_code_of(lat, lon)
                     if cc_now not in ccs:
                         continue
-            # Card 81: max_elev — skip tree/forest cards above treeline (fallback)
+            # Card 81: max_elev  skip tree/forest cards above treeline (fallback)
             me = cons.get("max_elev")
             if me and elev and elev > me:
                 continue
-            # Card 75: coast_only — skip coastal cards for inland biomes (fallback)
+            # Card 75: coast_only  skip coastal cards for inland biomes (fallback)
             if cons.get("coast_only") and biome not in ("coast", "island", "water"):
                 continue
             # Card 84: hemisphere constraint (fallback path)
@@ -546,13 +575,13 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
                 continue
             if hemi == "south" and lat > 0:
                 continue
-            # Card 85: lat_min — skip polar day/night cards below minimum latitude (fallback)
+            # Card 85: lat_min  skip polar day/night cards below minimum latitude (fallback)
             lat_min = cons.get("lat_min")
             if lat_min and abs_lat < lat_min:
                 continue
             raw_candidates.append((e["text"], cons.get("humidity")))
 
-    # Card 74/79: arid filtering — exclude humid cards for arid locations
+    # Card 74/79: arid filtering  exclude humid cards for arid locations
     if band in ("tropical", "sub") and biome in ("coast", "desert"):
         cc_now = country.country_code_of(lat, lon)
         if cc_now in _ARID_COUNTRIES_FULL:
@@ -562,7 +591,7 @@ def _check_phenology(dt: datetime, lat: float, rng: random.Random,
 
     candidates = [t for t, _ in raw_candidates]
 
-    # Card 58: biome filtering — desert/tundra excludes water-heavy content
+    # Card 58: biome filtering  desert/tundra excludes water-heavy content
     if biome in ("desert", "tundra"):
         _WATER_KEYWORDS = ["雨季", "河水", "岸边的树", "瀑布", "水位", "涨水"]
         _TROPICAL_KEYWORDS = ["芭蕉", "椰子", "棕榈", "热带雨林"]
@@ -593,7 +622,7 @@ def _check_anniversary(lat: float, lon: float, dt: datetime,
     if not year_str:
         return None
 
-    # Parse year — format varies: "1950", "1467-1477", "1950-01", "1950-01-15"
+    # Parse year  format varies: "1950", "1467-1477", "1950-01", "1950-01-15"
     import re
     year_str = str(year_str).strip()
     m = re.match(r"(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?", year_str)
@@ -625,8 +654,8 @@ def _check_anniversary(lat: float, lon: float, dt: datetime,
 
 _WEEKDAY_FRIDAY_LOOSENING: list[str] = [
     "周五傍晚,街上的人走慢了。空气里有周末的味道。",
-    "周五晚上。城里的人松下来了,酒吧的门开着。",
-    "周五。路上的车少了,人行道上多了遛弯的人。",
+    "周五晚上。城里的人松下来了酒吧的门开着。",
+    "周五。路上的车少了人行道上多了遛弯的人。",
     "周末前夜。霓虹灯亮得比平时早。",
     "周五傍晚,外卖骑手比行人多。城市在松绑。",
 ]
@@ -634,8 +663,8 @@ _WEEKDAY_FRIDAY_LOOSENING: list[str] = [
 _WEEKDAY_SUNDAY_MORNING: dict[str, list[str]] = {
     "western": [
         "周日上午,教堂的钟在远处敲。风把钟声送过来。",
-        "星期天早上。街上安静,只有教堂门口有人在寒暄。",
-        "周日。钟声从教堂的方向传来,空气里有管风琴的回声。",
+        "星期天早上。街上安面只有教堂门口有人在寒暄。",
+        "周日。钟声从教堂的方向传来空气里有管风琴的回声。",
     ],
     "east_asia": [
         "周日早上。公园里有人在打太极,慢的,像水在流。",
@@ -643,8 +672,8 @@ _WEEKDAY_SUNDAY_MORNING: dict[str, list[str]] = {
         "周日上午,广场上有人在跳舞,音箱放着老歌。",
     ],
     "commercial": [
-        "周日上午。商场还没开门,清洁工在拖地。",
-        "星期天早上。街上空荡荡的,店铺的卷帘门还没拉起来。",
+        "周日上午。商场还没开门清洁工在拖地。",
+        "星期天早上。街上空荡荡的店铺的卷帘门还没拉起来。",
         "周日。购物中心的停车场还是空的。城市在睡懒觉。",
     ],
 }
@@ -656,11 +685,11 @@ _WEEKDAY_MONDAY_CLOSED: list[str] = [
 ]
 
 _WEEKDAY_MARKET_VARIANTS: list[str] = [
-    "赶集日。路边摆满了竹筐,筐里是活鸡活鸭,嘎嘎叫。",
-    "集市上,老太太用手掂秤,不看刻度,全凭手感。",
-    "赶集。地上铺着塑料布,上面堆着红辣椒和干蘑菇。",
-    "集市里,鸡笼摞着鸡笼,最底下那只眼神最绝望。",
-    "赶集日。竹篮里是刚摘的菜,叶子上还有虫眼。",
+    "赶集日。路边摆满了竹筐,筐里是活鸡活鸡嘎嘎叫。",
+    "集市一老太太用手掂科不看刻度,全凭手感。",
+    "赶集。地上铺着塑料市上面堆着红辣椒和干蘑菇。",
+    "集市里鸡笼摞着鸡笼,最底下那只眼神最绝望。",
+    "赶集日。竹篮里是刚摘的菜叶子上还有虫眼。",
     "赶集。秤砣在秤杆上滑,卖家和买家都不着急。",
 ]
 
@@ -695,13 +724,13 @@ def _get_weekday_rhythm(dt: datetime, lat: float, lon: float,
         if rng.random() < 0.3:
             return rng.choice(_WEEKDAY_MONDAY_CLOSED)
 
-    # 赶集日: Chinese market days based on lunar calendar
+    # 赶集日 Chinese market days based on lunar calendar
     if _ZhDate is not None:
         try:
             lunar = _lunar_info(dt)
             if lunar:
                 ld = lunar["lunar_day"]
-                # 一四七/二五八/三六九 pattern (last digit of lunar day)
+                # 一四七/二五光三六之pattern (last digit of lunar day)
                 last_digit = ld % 10
                 # Use place hash to assign market group
                 is_market_day = last_digit in (1, 4, 7)  # default group
@@ -719,17 +748,17 @@ def _get_weekday_rhythm(dt: datetime, lat: float, lon: float,
 
 _FESTIVAL_VARIANTS: dict[str, list[str]] = {
     "春节": [
-        "大年初一。空气里全是火药味,地上是红色的炮仗纸。",
-        "春节。街上空了,店铺关着门,门上贴着新的福字。",
-        "过年。远处有鞭炮声,断断续续,从天亮就开始了。",
+        "大年初一。空气里全是火药味地上是红色的炮仗纸。",
+        "春节。街上空了店铺关着门门上贴着新的福字。",
+        "过年。远处有鞭炮声断断续续,从天亮就开始了。",
     ],
     "元宵节": [
-        "正月十五。灯笼挂在街上,红的黄的,风一吹晃。",
+        "正月十五。灯笼挂在街一红的黄的,风一吹晃。",
         "元宵节。汤圆在锅里浮着,甜的。夜里的灯比月亮亮。",
     ],
     "端午节": [
         "端午。空气里有粽叶的味道,糯米黏在手上。",
-        "端午节。龙舟在水上走,鼓声一下一下的。",
+        "端午节。龙舟在水上走鼓声一下一下的。",
     ],
     "七夕": [
         "七夕。夜里抬头看,银河淡淡的。街上有人在卖花。",
@@ -740,12 +769,12 @@ _FESTIVAL_VARIANTS: dict[str, list[str]] = {
         "中元。河里放了灯,一盏一盏往下游漂。",
     ],
     "中秋节": [
-        "中秋。月亮从东边升起来,圆的,大得不像话。",
-        "八月十五。月饼甜得腻人,但你还是吃了一个。",
+        "中秋。月亮从东边升起来圆的,大得不像话。",
+        "八月十五。月饼甜得腻了但你还是吃了一个。",
         "中秋节。月亮把你的影子投在地上,比白天的太阳还清楚。",
     ],
     "重阳节": [
-        "重阳。远处的山上有人在登高,声音从上面传下来。",
+        "重阳。远处的山上有人在登高声音从上面传下来。",
     ],
     "除夕": [
         "除夕。天还没黑就有炮声了。一年在响声里翻过去了。",
@@ -823,7 +852,7 @@ def _compute_timeaxes(dt: datetime, lat: float, lon: float,
     """
     layers: list[dict] = []
 
-    # 1. Festival (农历节日) — highest priority
+    # 1. Festival (农历节日)  highest priority
     fest_text = _get_lunar_festival_text(dt, rng)
     if fest_text:
         layers.append({
@@ -831,11 +860,9 @@ def _compute_timeaxes(dt: datetime, lat: float, lon: float,
             "text": fest_text, "data": {},
         })
 
-    # 2. Anniversary (纪念日)
+    # 2. Anniversary (纪念日
     ann = _check_anniversary(lat, lon, dt, seen_humanities)
     if ann:
-        # Restrained tone for war/disaster, warm for cultural
-        cat = ann.get("category", "事件")
         layers.append({
             "priority": _TP_ANNIVERSARY, "kind": "anniversary",
             "text": ann["text"], "data": ann,
@@ -851,7 +878,7 @@ def _compute_timeaxes(dt: datetime, lat: float, lon: float,
                 "text": m_text, "data": meteor,
             })
 
-    # 4. Phenology (物候) — includes biological clock
+    # 4. Phenology (物候  includes biological clock
     pheno_text = _check_phenology(dt, lat, rng, biome=biome, elev=elev, lon=lon)
     if pheno_text:
         layers.append({
@@ -881,7 +908,7 @@ def _compute_timeaxes(dt: datetime, lat: float, lon: float,
 
 
 def _timeaxis_to_env(dt: datetime, lat: float, lon: float) -> dict:
-    """Compute timeaxis data for env dict (not text — time is for feeling, not reporting)."""
+    """Compute timeaxis data for env dict (not text  time is for feeling, not reporting)."""
     env: dict[str, Any] = {}
     # Lunar info
     lunar = _lunar_info(dt)
@@ -951,7 +978,7 @@ _QUIET_VARIANTS: list[str] = [
     "四下无人,只有风声。",
     "安静得能听到自己的心跳。",
     "什么声音也没有。世界好像只剩你一个。",
-    "这里没有路,也没有人走过的痕迹。",
+    "这里没有路也没有人走过的痕迹。",
 ]
 
 # 留白: 缓存命中且世界没变时的回话——路就是路
@@ -968,12 +995,12 @@ _QUIET_WAIT = [
     "什么都没变,只有时间变了。",
 ]
 
-# ── Card 53: 重地落地变体——少声色多留白 ─────────────────────────────
-# 禁煽情禁消费,禁"很/非常/十分"。
+# ── Card 53: 重地落地变体——少声色多留白─────────────────────────────
+# 禁煽情禁消费,离得非常/十分"。"
 _HEAVY_ARRIVE_VARIANTS: list[str] = [
-    "街上安静。不是没有声音,是声音到这里变轻了。",
+    "街上安静。不是没有声音是声音到这里变轻了。",
     "你站了一会儿。不知道该往哪走。",
-    "空气里有一种重量,不是天气的那种。",
+    "空气里有一种重里不是天气的那种。",
     "脚步慢下来了。不是累,是别的什么。",
     "你抬头看,天还是那个天。但地不一样。",
 ]
@@ -982,25 +1009,25 @@ _HEAVY_ARRIVE_VARIANTS: list[str] = [
 _BURY_VARIANTS: list[str] = [
     "你把{name}埋进了土里。这里记得。",
     "土盖上了。{name}留在这了。",
-    "你蹲下来,把{name}放好,盖上土。站起来的时候,像完成了什么。",
+    "你蹲下来,把{name}放好,盖上土。站起来的时候像完成了什么。",
     "{name}进土里了。这个地方多了一份你的东西。",
 ]
 _FIND_VARIANTS: list[str] = [
-    "脚碰到硬的东西,不是石头。你蹲下去挖。",
-    "土里有个角,铁的。你用手指抠出来。",
-    "踢到一个铁盒,声音闷的,里面有东西。",
-    "鞋带勾到什么,低头看,是个铁盒埋在浅土里。",
+    "脚碰到硬的东西不是石头。你蹲下去挖。",
+    "土里有个见铁的。你用手指抠出来。",
+    "踢到一个铁直声音闷的,里面有东西。",
+    "鞋带勾到什么低头看是个铁盒埋在浅土里。",
 ]
 _PUTBACK_VARIANTS: list[str] = [
     "你把它又放了回去。",
-    "你看了它一眼,又埋了回去。",
+    "你看了它一看又埋了回去。",
 ]
 
 # ── Card 15: atlas variants ──────────────────────────────────────
 _ATLAS_VARIANTS: list[str] = [
-    "你去过 {places} 个地方,踩过 {continents} 个洲。最北到{north},最南到{south}。",
-    "{places} 个地方,{continents} 个洲。北至{north},南至{south},世界被你走了一圈。",
-    "足迹: {places} 地,{continents} 洲。最北{north},最南{south},最东{east},最西{west}。",
+    "你去过{places} 个地斯踩过 {continents} 个洲。最北到{north},最南到{south}。",
+    "{places} 个地斯{continents} 个洲。北至{north},南至{south},世界被你走了一圈。",
+    "足迹: {places} 在{continents} 洲。最北{north},最南{south},最东{east},最西{west}。",
 ]
 _EMPTY_BURY_VARIANTS: list[str] = [
     "你没东西可埋。空手来的。",
@@ -1054,10 +1081,10 @@ def _get_seasonal_soundscape(filename: str) -> dict[tuple[str, str], list[str]]:
 
 
 def _pick_fresh(pool: list[str], rng: random.Random) -> str | None:
-    """从场景池挑一条, 避开最近用过的文本(跨调用去重)。
+    """从场景池挑一来 避开最近用过的文本(跨调用去里。"
 
-    全用过就退回整个池子。挑选结果记进 _state.recent_scenes,
-    供下次调用和 describe.render 复用。
+    全用过就退回整个池子。挑选结果记过_state.recent_scenes,
+    供下次调用和 describe.render 复用。"
     """
     if not pool:
         return None
@@ -1083,7 +1110,7 @@ def _last_env_surface() -> str:
     """Read ``surface`` from ``_state.last_env``.
 
     Current code always writes flat format.  Old saved journeys may still have
-    nested ``terrain`` key — both are handled for backward compatibility.
+    nested ``terrain`` key  both are handled for backward compatibility.
     """
     env = _state.last_env or {}
     nested = env.get("terrain")
@@ -1096,13 +1123,13 @@ def _last_env_terrain_dict() -> dict:
     """Return terrain dict from ``_state.last_env``.
 
     Current code always writes flat format.  Old saved journeys may still have
-    nested ``terrain`` key — both are handled for backward compatibility.
+    nested ``terrain`` key  both are handled for backward compatibility.
     """
     env = _state.last_env or {}
     nested = env.get("terrain")
     if isinstance(nested, dict):
         return nested
-    # Top-level shape — synthesize a terrain dict.
+    # Top-level shape  synthesize a terrain dict.
     out: dict = {}
     if "elevation" in env:
         out["elevation"] = env["elevation"]
@@ -1130,7 +1157,7 @@ async def _get_radio(lat: float, lon: float) -> dict | None:
             d = _km((lat, lon), (st_lat, st_lon))
             if d > 3000:
                 return None
-    # Card 71 B2: reject stations from wrong country (Budapest ≠ CZ radio)
+    # Card 71 B2: reject stations from wrong country (Budapest ≀CZ radio)
     if station is not None and cc:
         st_cc = station.get("country", "")
         if st_cc and st_cc != cc:
@@ -1173,10 +1200,10 @@ def _parse_bearing(direction: str) -> tuple[float | None, str | None, bool]:
 _DEST_TEMPLATES: list[str] = [
     "风从{dir}吹来,那边有{place}。",
     "{dir}方有什么在等着,{place}不远了。",
-    "空气里隐约有{place}的方向,往{dir}走试试。",
+    "空气里隐约有{place}的方后往{dir}走试试。",
     "脚下这条路通往{place},就在{dir}边。",
     "{dir}边的地平线上,{place}的轮廓若隐若现。",
-    "远处{dir}方,{place}像一个还没讲完的故事。",
+    "远处{dir}斯{place}像一个还没讲完的故事。",
 ]
 
 # ── Density decay: wilderness depth calculation (Card 40) ──────────
@@ -1225,47 +1252,47 @@ def _compute_wilderness_depth_km(lat: float, lon: float) -> float:
 
 # ── Deep wilderness variants (Card 40) ─────────────────────────────
 
-# "荒深档": sky/earth/body only, world quiet but not empty
-# Forbidden: "什么都没有" — use light/wind/ground texture
+# "荒深桥: sky/earth/body only, world quiet but not empty
+# Forbidden: "什么都没有"  use light/wind/ground texture
 _WILDERNESS_VARIANTS: list[str] = [
     "地平线在四面八方同时弯下去。风从左边来,又从右边来。",
-    "云很低,像一块灰色的布盖在世界上。你的影子不见了。",
-    "脚下是干裂的泥,裂缝里有蚂蚁在走。它们比你忙。",
+    "云很你像一块灰色的布盖在世界上。你的影子不见了。",
+    "脚下是干裂的法裂缝里有蚂蚁在走。它们比你忙。",
     "远处有什么在反光,走了很久也没走到。可能是石头,可能是水。",
     "风把你的衣服吹得贴在身上。你闻到尘土的味道。",
-    "天和地之间只有你。不是孤独,是空旷。",
-    "地面是平的,一直平到天边。你的脚步声是唯一的声音。",
-    "空气干得嘴唇裂了。你舔了一下,是血的味道。",
+    "天和地之间只有你。不是孤独是空旷。",
+    "地面是平的一直平到天边。你的脚步声是唯一的声音。",
+    "空气干得嘴唇裂了。你舔了一一是血的味道。",
 ]
 
 
 # ── Deep wilderness procedural features (12 variants) ──────────────
 
 _WILDERNESS_FEATURES: list[str] = [
-    "一棵树,不知道为什么长在这里。树干弯了,朝着风的方向。",
+    "一棵树,不知道为什么长在这里。树干弯了朝着风的方向。",
     "一段旧路基,石头被磨得光滑。不知道通向哪里。",
-    "一个泉眼,水从石头缝里渗出来。你蹲下来喝了一口,凉的。",
-    "一堆石头,排成了圈。不知道是人放的还是风吹的。",
+    "一个泉看水从石头缝里渗出来。你蹲下来喝了一口凉的。",
+    "一堆石头排成了圈。不知道是人放的还是风吹的。",
     "一根电线杆,歪了,没有电线。不知道什么时候倒的。",
-    "一截铁路,铁轨锈了,枕木烂了。草从铁轨缝里长出来。",
+    "一截铁路铁轨锈了,枕木烂了。草从铁轨缝里长出来。",
     "一个坑,不知道挖来做什么的。坑底有积水,绿色的。",
-    "一块水泥板,上面有字,看不清了。你用手擦了擦,还是看不清。",
-    "一棵枯树,树皮剥落了,木头是白色的。鸟在上面筑了巢。",
+    "一块水泥板,上面有字,看不清了。你用手擦了擦还是看不清。",
+    "一棵枯树树皮剥落了木头是白色的。鸟在上面筑了巢。",
     "一条干涸的河床,石头被水冲得圆圆的。你走在上面,硌脚。",
-    "一个土堆,上面长满了草。你绕过去,什么也没有。",
-    "一块界碑,字被风沙磨平了。你不知道这里是哪里的边界。",
+    "一个土堂上面长满了草。你绕过去什么也没有。",
+    "一块界碎字被风沙磨平了。你不知道这里是哪里的边界。",
 ]
 
 
 # ── Deep wilderness procedural flesh event (5% after 10+ steps) ────
 
 _WILDERNESS_FLESH_EVENTS: list[str] = [
-    "你的手背上有一道伤痕,不知道什么时候划的。血已经干了。",
-    "你低头看脚,鞋带散了。你蹲下来系,发现鞋底磨穿了一块。",
-    "你的嘴唇裂了。你用舌头舔了一下,咸的。",
-    "你发现口袋里有一张纸,皱巴巴的。你展开看,什么也没写。",
-    "你的膝盖响了一声。你停下来,等了一会儿,又走了。",
-    "你看见自己的影子,比刚才长了。你走了多久了?",
+    "你的手背上有一道伤痕不知道什么时候划的。血已经干了。",
+    "你低头看脚鞋带散了。你蹲下来系,发现鞋底磨穿了一块。",
+    "你的嘴唇裂了。你用舌头舔了一一咸的。",
+    "你发现口袋里有一张纸,皱巴巴的。你展开看什么也没写。",
+    "你的膝盖响了一声。你停下来等了一会儿,又走了。",
+    "你看见自己的影子,比刚才长了。你走了多久了",
 ]
 
 
@@ -1396,9 +1423,9 @@ def _find_river_segment(
 ) -> dict | None:
     """Find a specific river segment from offline data.
 
-    segment_hint: e.g. "上海段", "入海口", "三峡段". Empty = scenic default.
+    segment_hint: e.g. "上海段",  "入海口",  "三峡段. Empty = scenic default.
     lat/lon: when both provided, score by haversine distance to each segment
-             (Card 71 — solves "Taicang gets Three Gorges" because the scenic
+             (Card 71  solves "Taicang gets Three Gorges" because the scenic
              default ignores caller coordinates).
              When lat or lon is None, fall back to the scenic default
              (三峡 / 宜昌), preserving legacy behavior for hint-only callers.
@@ -1410,7 +1437,7 @@ def _find_river_segment(
     except Exception:
         return None
 
-    # Synonym mapping: user-facing terms → segment note keywords
+    # Synonym mapping: user-facing terms ↀsegment note keywords
     _SEGMENT_SYNONYMS: dict[str, list[str]] = {
         "入海口": ["上海", "东营"],
         "入海": ["上海", "东营"],
@@ -1431,7 +1458,7 @@ def _find_river_segment(
         hint_keywords.extend(_SEGMENT_SYNONYMS[hint_lower])
 
     # Card 71: when caller provides lat/lon, score by haversine distance so
-    # Taicang (31.45, 121.1) lands on 上海段 rather than 三峡段.
+    # Taicang (31.45, 121.1) lands on 上海段rather than 三峡段
     use_distance = lat is not None and lon is not None
 
     best = None
@@ -1450,7 +1477,7 @@ def _find_river_segment(
         elon = entry.get("lon", 111.0)
 
         if hint_keywords:
-            # Hint matches override distance — caller asked for a specific segment.
+            # Hint matches override distance  caller asked for a specific segment.
             if not any(kw in note for kw in hint_keywords):
                 continue
             # Score: prefer exact hint match, then synonym match
@@ -1459,12 +1486,12 @@ def _find_river_segment(
             else:
                 score = len(note)
         elif use_distance:
-            # No hint but caller provided coords → nearest by haversine.
+            # No hint but caller provided coords ↀnearest by haversine.
             # Larger distance = lower score; nearest wins.
             d_km = places._haversine_km(lat, lon, elat, elon)
             score = -d_km
         else:
-            # Legacy: no hint, no coords → scenic fallback so callers like
+            # Legacy: no hint, no coords ↀscenic fallback so callers like
             # open_door('长江') without prior lat/lon still get a reasonable
             # default (三峡 / 宜昌).
             scenic = any(s in note for s in ("三峡", "gorge", "scenic", "宜昌"))
@@ -1547,25 +1574,25 @@ def _river_alignment_text(
         # Walking along river
         if dot > 0:
             variants = [
-                "江水和你一个方向,它走得比你稳。",
+                "江水和你一个方后它走得比你稳。",
                 "你顺着江走。水声一直在右边,不远不近。",
-                "你和江往同一个方向去。它比你快,但你不在乎。",
-                "沿江走,水声是你的节拍器。不急。",
+                "你和江往同一个方向去。它比你心但你不在乎。",
+                "沿江走水声是你的节拍器。不急。",
                 "你顺着水流的方向走。岸边的芦苇被水推着,弯了又直。",
-                "下游的方向。水声不大,但一直在。你的脚步跟着它的节奏。",
-                "你和江平行着走。它走它的,你走你的,但方向一样。",
+                "下游的方向。水声不大但一直在。你的脚步跟着它的节奏。",
+                "你和江平行着走。它走它的你走你的,但方向一样。",
                 "顺着江走,水面反着光。偶尔有漩涡,转一下就不见了。",
             ]
         else:
             variants = [
-                "你逆着江走。水声迎面过来,一步一步。",
-                "江从你对面来。你走一步,它推一步。",
+                "你逆着江走。水声迎面过来一步一步。",
+                "江从你对面来。你走一步它推一步。",
                 "你和江对着走。它不停,你也不停。",
                 "逆流。风从上游吹下来,带着水汽。",
                 "你往上游走。水在脚边涌,像在跟你较劲。",
                 "逆着水走,每一步都踩在它退回去的尾巴上。",
-                "你和江逆着走。它推你,你推它,谁也没赢。",
-                "上游的水冲下来,撞在石头上碎了。你沿着碎声走。",
+                "你和江逆着走。它推你,你推家谁也没赢。",
+                "上游的水冲下来撞在石头上碎了。你沿着碎声走。",
             ]
         # Dedup: avoid repeating within recent scenes
         recent = set(_state.recent_scenes)
@@ -1580,13 +1607,13 @@ def _river_alignment_text(
         # Walking across river
         variants = [
             "你横着江的走向走。水声从侧面流过。",
-            "你垂直于江面走。每走一步,水声换个方位。",
+            "你垂直于江面走。每走一步水声换个方位。",
             "横渡的方向。江在你左边,又到了右边。",
             "你横着过。水声从正前方移到了背后。",
-            "你和江十字交叉。水声换了方向,像有人在转收音机。",
-            "横着走,江面越来越宽。你没过河,但水声变了。",
-            "你穿过江的走向。水在左边,然后在右边,然后听不见了。",
-            "横渡。你没下水,但水声一直在侧边跟着你。",
+            "你和江十字交叉。水声换了方后像有人在转收音机。",
+            "横着走江面越来越宽。你没过河但水声变了。",
+            "你穿过江的走向。水在左边然后在右边然后听不见了。",
+            "横渡。你没下水但水声一直在侧边跟着你。",
         ]
         # Dedup: avoid repeating within recent scenes
         recent = set(_state.recent_scenes)
@@ -1612,7 +1639,7 @@ _COUNTRY_ZH: dict[str, str] = describe._COUNTRY_ZH
 def _load_discovery_scenes() -> list[str]:
     """Load walk discovery scenes from scene_walk_discovery.txt.
 
-    Uses describe._load_scenes which strips biome tags (#林 #山 etc.)
+    Uses describe._load_scenes which strips biome tags (#林#山etc.)
     from line starts for backward-compatible rendering.
     """
     global _DISCOVERY_CACHE
@@ -1631,7 +1658,7 @@ _SURFACE_TO_DISCOVERY_BIOME: dict[str, str] = {
 # Map biome names to discovery tag sets
 _BIOME_TO_DISCOVERY_TAGS: dict[str, set[str]] = {
     "forest": {"#林"}, "grassland": {"#林"}, "rainforest": {"#林"},
-    "desert": {"#漠"}, "tundra": {"#极"},
+    "desert": {"#漠"}, "tundra": {"#林"},
     "mountain": {"#山"}, "coast": {"#海"}, "island": {"#海"},
     "city": {"#城"}, "urban": {"#城"},
     "volcano": {"#山"},
@@ -1715,13 +1742,13 @@ def _wide_coast_scan(lat: float, lon: float) -> tuple[float | None, float | None
     """Scan 8 directions up to 5000km for ocean (coarser: 50km steps).
 
     Returns (min_km, bearing_deg) or (None, None).
-    Used only for rejection text — precision not critical.
+    Used only for rejection text  precision not critical.
     """
     from nowhere import terrain as _t
     origin_elev = _t.elevation(lat, lon)
     # Card 64: origin-elevation plausibility gate.
     # Standing above 3000 m (Himalayas/Tibet/Andes): real ocean cannot
-    # be within 500 km — coarse-grid "water_ocean" cells closer than
+    # be within 500 km  coarse-grid "water_ocean" cells closer than
     # that are grid artifacts with garbage elevations.
     min_believable_km = 500.0 if origin_elev > 3000 else 0.0
 
@@ -1766,8 +1793,8 @@ _FAR_COAST_VARIANTS: list[str] = [
 # Card 64: timezone jump acknowledgement variants (not smoothing the jump)
 _TZ_JUMP_VARIANTS: list[str] = [
     "你过了道界。表上的时间跳了一截。",
-    "手机自己把时区换了,你看着它跳。",
-    "一步之间,时间变了。你不意外——边界就是这样。",
+    "手机自己把时区换了你看着它跳。",
+    "一步之间时间变了。你不意外——边界就是这样。",
 ]
 
 
@@ -1859,13 +1886,13 @@ def _build_walk_narrative(
     narrative["distance_walked"] += dist_km * 1000
     walked = narrative["distance_walked"]
     if walked > 10000:
-        parts.append(f"你已经走了{walked / 1000:.0f}公里了。回头,来时的路已经看不见。")
+        parts.append(f"你已经走了{walked / 1000:.0f}公里了。回大来时的路已经看不见。")
         narrative["distance_walked"] = 0
     elif walked > 5000 and rng.random() < 0.3:
         parts.append(rng.choice([
             "脚下的路又延伸了一截。",
             "又走出几公里,路还在前面。",
-            "风里走了一段,路程拉长了。",
+            "风里走了一段路程拉长了。",
         ]))
         narrative["distance_walked"] = 0
 
@@ -1946,13 +1973,13 @@ async def _gather_env(lat: float, lon: float, dt: datetime) -> dict[str, Any]:
     }
 
 
-# env 惯性: 3km/30min 内,风还是那个风
+# env 惯总 3km/30min 冰风还是那个风
 _ENV_CACHE_KM = 3.0
 _ENV_CACHE_MIN = 30
 
 
 async def _gather_env_cached(lat: float, lon: float, dt: datetime) -> tuple[dict, bool]:
-    """3km/30min 内复用上次 env。返回 (env, 缓存命中?)。"""
+    """3km/30min 内复用上次env。返国(env, 缓存命中?)。"""
     if (
         _state.last_env is not None
         and _state.env_pos is not None
@@ -2136,7 +2163,7 @@ def _festival_in_window(fest: dict, sim_date: _date, lat: float,
 
     Card 68: lat_rule entries must declare geographic range (countries[] or
     lat_band[]).  If the caller's location is outside that range the window
-    is treated as closed — lat_rule is no longer a catch-all bucket.
+    is treated as closed  lat_rule is no longer a catch-all bucket.
     """
     window = fest.get("window", {})
     wtype = window.get("type", "fixed")
@@ -2178,7 +2205,7 @@ def _festival_in_window(fest: dict, sim_date: _date, lat: float,
         return fest_start <= sim_date <= fest_end
 
     elif wtype == "lat_rule":
-        # Card 68: geo constraint gate — reject if outside declared range
+        # Card 68: geo constraint gate  reject if outside declared range
         geo_countries = window.get("countries")
         geo_lat_band = window.get("lat_band")
         if geo_countries:
@@ -2210,9 +2237,9 @@ def _is_local_festival(fest: dict) -> bool:
     """Check if a festival is truly local (place-specific) vs national with a center.
 
     Uses scope field when present; falls back to name-based heuristic.
-    - scope="local" → always local
-    - scope="national" → always national (even with place)
-    - no scope → heuristic: place in name → local
+    - scope="local" ↀalways local
+    - scope="national" ↀalways national (even with place)
+    - no scope ↀheuristic: place in name ↀlocal
     """
     place = fest.get("place", "")
     if not place:
@@ -2222,7 +2249,7 @@ def _is_local_festival(fest: dict) -> bool:
         return True
     if scope == "national":
         return False
-    # Fallback: heuristic — place in name → local
+    # Fallback: heuristic  place in name ↀlocal
     name = fest.get("name", "")
     return place in name
 
@@ -2267,12 +2294,12 @@ def _check_festival_hit(
         if fest_place and place_name == fest_place:
             place_hits.append(fest)
         elif fest_place and _is_local_festival(fest):
-            # Local festival (scope≠national), different place → distance gate
+            # Local festival (scope≠national), different place ↀdistance gate
             if _fest_within_distance(fest_place, lat, lon):
                 place_hits.append(fest)
             # else: too far, skip
         elif fest_place and not _is_local_festival(fest):
-            # National festival with a center place → country bucket
+            # National festival with a center place ↀcountry bucket
             if fest_country and country_code and fest_country == country_code:
                 country_hits.append(fest)
         elif fest_country and country_code and fest_country == country_code:
@@ -2283,7 +2310,7 @@ def _check_festival_hit(
             geo_countries = fest.get("window", {}).get("countries")
             if geo_countries and country_code and country_code in geo_countries:
                 country_hits.append(fest)
-            # lat_band-only lat_rule entries: no country match → silent
+            # lat_band-only lat_rule entries: no country match ↀsilent
 
     # Pick best bucket (Card 68: removed lat_rule catch-all)
     hits = place_hits or country_hits
@@ -2334,11 +2361,11 @@ def _check_festival_hit(
             if fest_place and place_name == fest_place:
                 eve_place.append(fest)
             elif fest_place and _is_local_festival(fest):
-                # Local festival, different place → distance gate
+                # Local festival, different place ↀdistance gate
                 if _fest_within_distance(fest_place, lat, lon):
                     eve_place.append(fest)
             elif fest_place and not _is_local_festival(fest):
-                # National festival with center → country bucket
+                # National festival with center ↀcountry bucket
                 if fest_country and country_code and fest_country == country_code:
                     eve_country.append(fest)
             elif fest_country and country_code and fest_country == country_code:
@@ -2368,13 +2395,8 @@ def _check_festival_hit(
     # Card 66 fix: prepend festival name announcement
     fest_name = fest.get("name", "")
     if fest_name:
-        _ann_variants = [
-            f"今天是{fest_name}。",
-            f"{fest_name}。",
-            f"你到的这天,正是{fest_name}。",
-        ]
-        card = f"{rng.choice(_ann_variants)}{card}"
-    # Append eve_card if available (293张除夕/节前文案)
+        card = f"{_announce_festival_name(fest_name, rng)}{card}"
+    # Append eve_card if available (293张除大节前文案)
     eve_cards = fest.get("eve_cards", [])
     if eve_cards:
         card = f"{card}\n{rng.choice(eve_cards)}"
@@ -2382,11 +2404,14 @@ def _check_festival_hit(
 
 
 def _announce_festival_name(fest_name: str, rng: random.Random) -> str:
-    """Generate a festival name announcement prefix (3 variants)."""
+    """Generate a festival name announcement prefix (3 variants).
+
+    节日公告的唯一实现: _check_festival_hit 内联的重复变体表已并入这里。"
+    """
     _ANNOUNCE_VARIANTS = [
         f"今天是{fest_name}。",
         f"{fest_name}。",
-        f"你到的这天,正是{fest_name}。",
+        f"你到的这大正是{fest_name}。",
     ]
     return rng.choice(_ANNOUNCE_VARIANTS)
 
@@ -2398,7 +2423,7 @@ def _announce_festival_crossing(fest_name: str, rng: random.Random) -> str:
     """
     _CROSSING_VARIANTS = [
         f"街上忽然多了一倍的人——你才想起来,今晚是{fest_name}。",
-        f"远处传来鼓声。你愣了一下:今天是{fest_name}。",
+        f"远处传来鼓声。你愣了一一今天是{fest_name}。",
         f"空气里多了烟火味。{fest_name},到了。",
     ]
     return rng.choice(_CROSSING_VARIANTS)
@@ -2415,7 +2440,7 @@ def _check_near_festival(
 ) -> str | None:
     """Check if a festival starts within `days` days (not today).
 
-    Returns preview text like "三天后是七夕。" or None.
+    Returns preview text like "三天后是七夕。 or None.
     """
     if sim_time is None:
         return None
@@ -2484,11 +2509,11 @@ def _check_near_festival(
             if fest_place and place_name == fest_place:
                 pass
             elif fest_place and _is_local_festival(fest):
-                # Local festival, different place → distance gate
+                # Local festival, different place ↀdistance gate
                 if not _fest_within_distance(fest_place, lat, lon):
                     continue
             elif fest_place and not _is_local_festival(fest):
-                # National festival with center → country check
+                # National festival with center ↀcountry check
                 if fest_country and country_code and fest_country == country_code:
                     pass
                 else:
@@ -2520,10 +2545,10 @@ def _check_near_festival(
 _FESTIVAL_LOOK_KEYWORDS: dict[str, list[str]] = {
     "中元节": ["河灯", "纸船", "灯笼"],
     "雪顿节": ["晒佛", "酸奶"],
-    "春节": ["灯笼", "炮仗纸", "福字"],
+    "春节": ["灯笼", "炮仗红", "福字"],
     "元宵节": ["灯笼", "花灯"],
     "端午节": ["龙舟", "粽叶"],
-    "七夕": ["花", "灯"],
+    "七夕": ["乞巧", "烟火"],
     "中秋节": ["月饼", "灯笼"],
     "泼水节": ["水", "泼水"],
     "水灯节": ["水灯", "灯笼"],
@@ -2541,7 +2566,7 @@ def _get_festival_context(
 ) -> dict | None:
     """Get festival atmosphere context for rendering (look/walk).
 
-    Unlike _check_festival_hit, this does NOT select cards — it returns
+    Unlike _check_festival_hit, this does NOT select cards  it returns
     metadata for the rendering layer to weave into descriptions.
 
     Card 66 fix: local festivals (place in name) are strictly place-scoped;
@@ -2636,8 +2661,8 @@ def _build_salience_candidates(
             "payload": s,
         })
 
-    # radio (optional) — 冷却5步 + 只在换台/信号变化时再提。
-    # 同台复读时完全排除，避免"KCRW 在播…"每步都占 salience 名额。
+    # radio (optional)  冷却5步+ 只在换台/信号变化时再提。"
+    # 同台复读时完全排除，避免"KCRW 在播 每步都占 salience 名额。"
     r = env.get("radio")
     if r:
         prev_r = (prev_env or {}).get("radio")
@@ -2676,8 +2701,12 @@ async def open_door_impl(to: str | None = None, resume: bool = False, traveler_n
 
     Card 64: wraps _open_door_locked with rollback protection.
     If the landing crashes mid-way (leaving half-initialized state),
-    pos/biome/env are rolled back to the pre-landing snapshot.
+    the whole pre-landing state OBJECT is restored  拍字段快照回滚不出
+    旧旅程 _open_door_locked 会把全局 _state 换成新对豆 字段回填只会
+    打在新对象上, 旧旅程path/journey_log/quotes/postcards)已经丢了。"
     """
+    global _state
+    _old_state = _state
     _snap = {
         "pos": _state.pos,
         "biome": _state.biome,
@@ -2698,6 +2727,9 @@ async def open_door_impl(to: str | None = None, resume: bool = False, traveler_n
                 _hint_counter += 1
         return result
     except Exception:
+        # 整体恢复旧状态对豆 再把快照字段补回(覆盖 _open_door_locked
+        # 在旧对象上可能已做的少量改动, 如journey_log 的farewell)
+        _state = _old_state
         _state.pos = _snap["pos"]
         _state.biome = _snap["biome"]
         _state.last_env = _snap["last_env"]
@@ -2711,9 +2743,9 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     """Door body, called under _door_lock."""
     global _state, _rng, _recent_salience_kinds
 
-    # ── Card 82: parse " 新" suffix for force-fresh landing ─────────
+    # ── Card 82: parse " 斯 suffix for force-fresh landing ─────────
     force_fresh = False
-    if to and to.rstrip().endswith(" 新"):
+    if to and to.rstrip().endswith(" 斯"):
         to = to.rstrip()[:-2].rstrip()
         force_fresh = True
 
@@ -2751,8 +2783,9 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             _state = existing
             _rng = random.Random(int(os.environ["NOWHERE_SEED"])) if os.environ.get("NOWHERE_SEED") else random.Random()
             _recent_salience_kinds = set()
-            global _mishap_last_step
+            global _mishap_last_step, _mishap_echoed_id
             _mishap_last_step = -999
+            _mishap_echoed_id = None
             place = _state.place_name or to
 
             response_parts = [farewell_text]
@@ -2761,7 +2794,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             _r_season = describe._season(_state.now().month, _state.pos[0]) if _state.now() and _state.pos else ""
             _r_zh = describe._SEASON_EN_TO_ZH.get(_r_season, "")
             _r_steps = len(_state.path) if _state.path else 0
-            response_parts.append(f"回到了{place}的旅程。上次你在这走了{_r_steps}步,是{_r_zh}天。")
+            response_parts.append(f"回到了{place}的旅程。上次你在这走了{_r_steps}死是{_r_zh}天。")
 
             return {
                 "text": "\n".join(response_parts),
@@ -2776,7 +2809,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         if saved and saved.pos is not None:
             _state = saved
             restored = True
-            # Card 50: reset body state on continue ("睡了一觉,身体是你的了")
+            # Card 50: reset body state on continue ("睡了一见身体是你的了")
             _state.reset_body_state()
             global _postcard_counter
             _postcard_counter = max((c.get("id", 0) for c in _state.postcards), default=0)
@@ -2818,7 +2851,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             else:
                 result = await asyncio.wait_for(geocode.lookup(to), timeout=10.0)
                 if result is None:
-                    # Fallback: try river segment lookup (e.g. "长江 入海口")
+                    # Fallback: try river segment lookup (e.g. "长江 入海口)
                     river_names = ["长江", "黄河", "珠江", "松花江", "淮河", "海河", "辽河"]
                     found_river = False
                     for rname in river_names:
@@ -2839,7 +2872,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
                     lat, lon = result
                     place_name = to
 
-        # ── River segment awareness: 长江 → nearest scenic segment ──
+        # ── River segment awareness: 长江 ↀnearest scenic segment ──
         if to and "长江" in to and not found_river:
             segment_hint = ""
             parts = to.split()
@@ -2877,10 +2910,9 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         _state.biome = spot.get("biome") if spot else None
     elif not resume:
         # Fresh landing (random or named destination): always reset state
-        # Preserve seen sets to avoid re-triggering the same cards, and keep
-        # the one item carried in the traveller's pocket across doors.
-        old_seen_cards = _state.seen_cards.copy() if _state else set()
-        old_seen_humanities = _state.seen_humanities.copy() if _state else set()
+        # Keep the one item carried in the traveller's pocket across doors
+        # and queued messages.  (seen 集不做跨门拷贝 下方"地方记忆"两行会用
+        # placememory 的持久化结果无条件覆盖 拷贝是死存储)
         old_messages = list(_state.messages) if _state else []
         old_souvenir = _state.souvenir.copy() if _state and _state.souvenir else None
         lat = max(-90, min(90, lat))
@@ -2890,11 +2922,10 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         _state.landed_at = datetime.now(timezone.utc)
         _state.place_name = place_name
         _state.biome = spot.get("biome") if spot else None
-        _state.seen_cards = old_seen_cards
-        _state.seen_humanities = old_seen_humanities
         _state.messages.extend(old_messages)
         _state.souvenir = old_souvenir
         _mishap_last_step = -999
+        _mishap_echoed_id = None
     # Card 82: mark force_new_slug for fresh landing with existing name
     if force_fresh and not restored:
         _state.force_new_slug = True
@@ -2918,7 +2949,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     # 地方记忆: 这地方记得你
     _state.seen_cards = placememory.seen_cards(place_name)
     _state.seen_humanities = placememory.seen_humanities()
-    # 旅程内计数: fresh journey starts at 1, resume continues journey-local count
+    # 旅程内计教 fresh journey starts at 1, resume continues journey-local count
     if restored:
         visit_no = _state.visit_counts.get(place_name, 1)
     else:
@@ -2933,8 +2964,8 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             elevation=env.get("elevation"), surface=env.get("surface"),
         )
 
-    # biome 缺失时: 先取 pool.json 手核 biome(定向开门没有 landing 标签),
-    # 再按地表推。A10: pool 的 biome 是全库唯一带手核权威的来源。
+    # biome 缺失日 先取 pool.json 手核 biome(定向开门没有landing 标签),
+    # 再按地表推。A10: pool 的biome 是全库唯一带手核权威的来源。"
     if _state.biome is None:
         _state.biome = terrain.pool_biome(lat, lon, place_name)
     if _state.biome is None:
@@ -2957,7 +2988,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     except Exception:
         pass  # intentionally ignored: Overpass fallback
 
-    # Card 71 B1: filter water features by biome — inland city ≠ ocean
+    # Card 71 B1: filter water features by biome  inland city ≀ocean
     if water_features and (_state.biome or "") == "city":
         _coastal_types = {"coast", "sea", "ocean", "bay", "gulf"}
         _has_coastal = any(f.get("type", "") in _coastal_types for f in water_features)
@@ -3001,7 +3032,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         except Exception:
             logger.debug("marine_life failed", exc_info=True)
 
-    # ── 4. Salience candidates → rank ────────────────────────────────
+    # ── 4. Salience candidates ↀrank ────────────────────────────────
     # Card 53: compute heavy_nearby before ranking so gravity can warp scores
     _heavy_nearby = humanities.is_heavy_place(place_name)
     if not _heavy_nearby:
@@ -3019,7 +3050,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     top3 = salience.rank(candidates, _rng, recent_kinds=_recent_salience_kinds, intent=_state.intent, heavy_nearby=_heavy_nearby, situation=_situation)
     _recent_salience_kinds = {c["kind"] for c in top3}
 
-    # ── 5. 开幕镜头 + top3(天气/天空已被开幕吃掉)─────────────────────
+    # ── 5. 开幕镜大+ top3(天气/天空已被开幕吃排─────────────────────
     sound = soundscape.describe_sound(
         {
             "weather": env.get("weather") or {},
@@ -3029,7 +3060,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         },
         _rng,
     )
-    # 钩子从数据来: 电台/能爬的高处/水边/附近地标
+    # 钩子从数据来: 电台/能爬的高大水边/附近地标
     hooks: list[tuple[str, str | None]] = []
     if env.get("radio"):
         hooks.append(("radio", None))
@@ -3042,7 +3073,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     except AttributeError:
         pass  # intentionally ignored: walk_mod.best_uphill_gain may not exist yet
 
-    # 附近可去的地方——单独传，不跟其他钩子竞争
+    # 附近可去的地方——单独传，不跟其他钩子竞了
     nearby_places = _find_nearby_destinations(lat, lon, _rng)
     local_hour = None
     cc = None
@@ -3051,7 +3082,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         local_hour = _state.now().astimezone(ZoneInfo(tz_name)).hour
     cc = country.country_code_of(lat, lon)
     _now = _state.now()
-    # Card 16: blind mode — strip place name and country from header
+    # Card 16: blind mode  strip place name and country from header
     _blind = getattr(_state, "blind", False)
     establish = describe.render_establish(
         {
@@ -3077,7 +3108,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         sections[0] = f"又来了——第 {visit_no} 次来{place_name}。" + establish
 
     # ── 本地特色：localcolor 优先 ─────────────────────────────────
-    # Card 50: late-night (0-5am) city — food cards don't appear
+    # Card 50: late-night (0-5am) city  food cards don't appear
     _late_night_city = (local_hour is not None and 0 <= local_hour < 5
                         and _state.biome == "city")
     local_card = localcolor.draw(place_name, _state.seen_cards, _rng,
@@ -3101,7 +3132,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         # ── Card 43: flora notebook hook ────────────────────────────
         try:
             if "/植被/" in local_card.get("key", ""):
-                _flora_name = local_card["text"].split("。")[0].split(",")[0].split("，")[0].strip()
+                _flora_name = local_card["text"].split("。")[0].split(",")[0].split("）",)[0].strip()
                 if _flora_name:
                     _nb_env = dict(env) if env else {}
                     _nb_env["_dt"] = _state.now()
@@ -3109,27 +3140,27 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
         except Exception:
             logger.debug("open_door flora notebook failed", exc_info=True)
 
-    # ── Card 10: 痕迹链 — 世界在你离开后继续过日子 ───────────────
+    # ── Card 10: 痕迹铁 世界在你离开后继续过日子 ───────────────
     if placememory.has_trace(place_name) and not _blind:
         trace_text = placememory.get_trace_text(place_name)
         if trace_text and trace_text not in set(_state.recent_scenes):
             sections.append(trace_text)
             _state.recent_scenes.append(trace_text)
 
-    # ── Card 11: 节日历 — 在对的时间到对的地方 ─────────────────
+    # ── Card 11: 节日去 在对的时间到对的地方 ─────────────────
     if not _blind:
         fest_text = _check_festival_hit(place_name, cc, lat, _now, _rng, lon=lon)
         if fest_text and fest_text not in set(_state.recent_scenes):
             sections.append(fest_text)
             _state.recent_scenes.append(fest_text)
-        # ── Card 66: 近节预告 (7天内有节→报一句) ───────────────
+        # ── Card 66: 近节预告 (7天内有节→报一口 ───────────────
         if not fest_text:
             near_text = _check_near_festival(place_name, cc, lat, _now, _rng, lon=lon)
             if near_text and near_text not in set(_state.recent_scenes):
                 sections.append(near_text)
                 _state.recent_scenes.append(near_text)
 
-    # ── 六根时间轴(Card 46): landing 版,最多2层 ─────────────────
+    # ── 六根时间车Card 46): landing 物最大山─────────────────
     if _now is not None:
         _ta_layers = _compute_timeaxes(
             _now, lat, lon,
@@ -3166,12 +3197,12 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     _month = _now.month if _now else None
     prose = describe.sanity_check(prose, {**env, "_season": describe._season(_month, lat) if _month else "", "_place": place_name, "_cc": cc or ""})
 
-    # ── 5c. Card 53: 重地落地——少声色多留白 ────────────────────────
+    # ── 5c. Card 53: 重地落地——少声色多留白────────────────────────
     if _heavy_nearby and not _blind:
         _heavy_arrive = _rng.choice(_HEAVY_ARRIVE_VARIANTS)
         prose = _heavy_arrive + "\n" + prose
 
-    # ── 5d. 人文卡: 落点附近触发(Card 16: blind时禁抽) ───────────
+    # ── 5d. 人文十 落点附近触发(Card 16: blind时禁把 ───────────
     if not _blind:
         h_card = humanities.nearby_place(lat, lon, _state.seen_humanities, _rng)
         if h_card:
@@ -3180,10 +3211,10 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             excerpt = h_card["text"][:60] + ("..." if len(h_card["text"]) > 60 else "")
             prose += f"你落在了{h_card['place']}附近。这里有过——{excerpt}"
 
-    # ── 5e. web 旁观者: 首次开门告知用户地址 ───────────────────────
+    # ── 5e. web 旁观老 首次开门告知用户地址 ───────────────────────
     global _web_url_announced
     if _web_url and not _web_url_announced:
-        prose += f"\n（旁观者可以在这里看你走路：{_web_url}）"
+        prose += f"\n（旁观者可以在这里看你走路：{_web_url}）",
         _web_url_announced = True
 
     # Card 16: blind auto-disabled note
@@ -3210,7 +3241,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
             prose += f"\n{at_hint}"
 
     # ── 6. Save complete state and environment snapshot ───────────────
-    # Keep flat format consistent with _gather_env() — never nest under "terrain".
+    # Keep flat format consistent with _gather_env()  never nest under "terrain".
     _now_for_ta = _state.now()
     _ta_data = _timeaxis_to_env(_now_for_ta, lat, lon) if _now_for_ta else {}
     _state.last_env = {
@@ -3234,7 +3265,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
     # Card 17: door key text variant
     if norm_key:
         _key_variants = [
-            f"这扇门是{norm_key}开的。别人用同一个门牌,也会落在这里。",
+            f"这扇门是{norm_key}开的。别人用同一个门物也会落在这里。",
             f"你推开的是{norm_key}这扇门。世界同名的地方没有第二个。",
             f"{norm_key}——这扇门后面永远是同一个地方。",
         ]
@@ -3259,7 +3290,7 @@ async def _open_door_locked(to: str | None = None, resume: bool = False, travele
 
 
 # =====================================================================
-# Card 50: 身体的重量 — body state helpers
+# Card 50: 身体的重里 body state helpers
 # =====================================================================
 
 # ── Whim trigger conditions ─────────────────────────────────────────
@@ -3268,12 +3299,12 @@ _WHIM_POOL: list[dict] = [
     {
         "id": "radio_miss",
         "text": "你发现自己一直在想那个电台。",
-        "condition": "listen换台后旧台信号变弱",
+        "condition": "listen换台后旧台信号变开",
     },
     {
         "id": "hungry",
-        "text": "胃在提醒你,它先于脑子想吃了。",
-        "condition": "当地饭点+上一餐>6h",
+        "text": "胃在提醒你它先于脑子想吃了。",
+        "condition": "当地饭点+上一餐6h",
     },
     {
         "id": "river_follow",
@@ -3288,7 +3319,7 @@ _WHIM_POOL: list[dict] = [
     {
         "id": "revisit",
         "text": "你想回去看看。",
-        "condition": "离开某地>50km且痕迹链有进展",
+        "condition": "离开某地>50km且痕迹链有进山",
     },
 ]
 
@@ -3316,17 +3347,17 @@ def _try_emerge_whim(env: dict, rng: random.Random) -> str | None:
 
     candidates: list[dict] = []
 
-    # "想躲雨" — precip=rain, no shelter (outdoor)
+    # "想躲雨  precip=rain, no shelter (outdoor)
     if precip == "rain" and _state.mode == "land":
         candidates.append(_WHIM_POOL[3])
 
-    # "想看江往哪去" — near river, walked same direction 3+ steps
+    # "想看江往哪去"  near river, walked same direction 3+ steps
     water_features = env.get("water_features", [])
     has_river = any(f.get("type") == "river" for f in water_features)
     if has_river and _state.narrative.get("distance_walked", 0) > 5000:
         candidates.append(_WHIM_POOL[2])
 
-    # "饿了" — hunger>3 (simplified: sim time >6h since landing)
+    # "饿了"  hunger>3 (simplified: sim time >6h since landing)
     if _state.hunger > 3.0:
         candidates.append(_WHIM_POOL[1])
 
@@ -3374,7 +3405,7 @@ def _try_complete_whim(action: str, rng: random.Random) -> str | None:
 # ── Body state text injection ───────────────────────────────────────
 
 _HUNGER_TEXTS: list[str] = [
-    "胃在提醒你,它先于脑子想吃了。",
+    "胃在提醒你它先于脑子想吃了。",
     "肚子里空空的,走路的节奏乱了。",
     "你发现自己一直在想吃的。",
 ]
@@ -3394,17 +3425,17 @@ _COLD_TEXTS: list[str] = [
 _WET_TEXTS: list[str] = [
     "鞋里能挤出水了。",
     "衣服贴在身上,重了。",
-    "每走一步,袜子吱一声。",
+    "每走一步袜子吱一声。",
 ]
 
 _HYPOTHERmia_TEXTS: list[str] = [
-    "你得找个地方把自己弄干,现在。",
+    "你得找个地方把自己弄年现在。",
     "牙齿在打架。你控制不住。",
-    "你的嘴唇是紫的。你不知道,但手摸得到。",
+    "你的嘴唇是紫的。你不知道但手摸得到。",
 ]
 
 _FATIGUE_TEXTS: list[str] = [
-    "腿在提醒你,它们不是你的。",
+    "腿在提醒你它们不是你的。",
     "膝盖在响。每一步都响。",
     "你发现自己在数步数。",
 ]
@@ -3416,7 +3447,7 @@ _FATIGUE_SLOW_TEXTS: list[str] = [
 ]
 
 _FATIGUE_FORCE_REST_TEXTS: list[str] = [
-    "你坐下来了。不是你决定的,是身体决定的。",
+    "你坐下来了。不是你决定的是身体决定的。",
     "你的腿不动了。你站在原地,然后蹲了下来。",
     "身体赢了。你靠着什么坐下了。",
 ]
@@ -3428,9 +3459,9 @@ _EAT_CLEAR_TEXTS: list[str] = [
 ]
 
 _SOUPY_LOSS_TEXTS: list[str] = [
-    "你摸了摸口袋,{name}不见了。什么时候掉的,你不知道。",
+    "你摸了摸口袋,{name}不见了。什么时候掉的你不知道。",
     "口袋里少了什么——{name}。你不知道掉在哪了。",
-    "{name}没了。你翻了一遍口袋,只有风。",
+    "{name}没了。你翻了一遍口被只有风。",
 ]
 
 
@@ -3493,7 +3524,7 @@ def _update_body_state_walk(
     _state.fatigue = min(10.0, _state.fatigue + 1.0 * elapsed_hours)
 
     if _state.fatigue > 9.0:
-        # Forced rest — will be handled in walk_impl
+        # Forced rest  will be handled in walk_impl
         texts.append(rng.choice(_FATIGUE_FORCE_REST_TEXTS))
     elif _state.fatigue > 6.0:
         if rng.random() < 0.3:
@@ -3560,14 +3591,14 @@ def _check_storm_block(env: dict) -> str | None:
     weather = env.get("weather", {})
     precip = weather.get("precip", "none")
     if precip == "storm" and _state.mode == "land":
-        return "雨太大了,你走不了。找地方躲,或者等。"
+        return "雨太大了,你走不了。找地方身或者等。"
     return None
 
 
 def _check_fatigue_slope_block(slope_deg: float) -> str | None:
     """Check if fatigue + steep slope blocks walking. Card 50: body+terrain."""
     if slope_deg > 30.0 and _state.fatigue > 6.0:
-        return "这个坡,你现在上不去。歇够了再来,或者绕。"
+        return "这个坡你现在上不去。歇够了再来,或者绕行。"
     return None
 
 
@@ -3597,37 +3628,37 @@ def _body_text_for_food_clear(rng: random.Random) -> str:
 
 _SOUVENIR_TEMPLATES: dict[str, list[dict]] = {
     "desert": [
-        {"name": "一块风蚀石", "desc": "你捡了一块石头，风把它磨得光滑。你把它揣进口袋。"},
-        {"name": "一粒沙", "desc": "沙子钻进了鞋里。你倒出来，攥在手心，没扔。"},
+        {"name": "一块风蚀石", "desc": "你捡了一块石头，风把它磨得光滑。你把它揣进口袋。。"},
+        {"name": "一粒沙", "desc": "沙子钻进了鞋里。你倒出来，攥在手心，没扔。。"},
     ],
     "forest": [
-        {"name": "一片落叶", "desc": "地上有一片叶子，脉络清楚得像地图。你把它夹在手指间。"},
-        {"name": "一截枯枝", "desc": "你捡了一截枯枝，树皮已经掉了，木头是温的。"},
+        {"name": "一片落叶", "desc": "地上有一片叶子，脉络清楚得像地图。你把它夹在手指间。。"},
+        {"name": "一截枯林", "desc": "你捡了一截枯枝，树皮已经掉了，木头是温的。。"},
     ],
     "mountain": [
-        {"name": "一块碎石", "desc": "碎石里有一块，断面闪着光。你把它放进口袋。"},
-        {"name": "一片冰碴", "desc": "你从冰面上掰了一小块，攥在手里，凉得发麻。它在慢慢变小。"},
+        {"name": "一块碎石", "desc": "碎石里有一块，断面闪着光。你把它放进口袋。。"},
+        {"name": "一片冰碎", "desc": "你从冰面上掰了一小块，攥在手里，凉得发麻。它在慢慢变小。。"},
     ],
     "water": [
-        {"name": "一瓶江水", "desc": "你蹲下来，用手捧了一捧水，装进瓶子里。水是浑的，有泥沙的味道。"},
-        {"name": "一枚贝壳", "desc": "沙子里露出半枚贝壳，边缘已经被磨圆了。你把它捡起来。"},
+        {"name": "一瓶江水", "desc": "你蹲下来，用手捧了一捧水，装进瓶子里。水是浑的，有泥沙的味道。。"},
+        {"name": "一枚贝声", "desc": "沙子里露出半枚贝壳，边缘已经被磨圆了。你把它捡起来。。"},
     ],
     "snow": [
-        {"name": "一片雪花", "desc": "你伸出手，一片雪花落在掌心。还没来得及看清就化了。你又接了一片。"},
-        {"name": "一块冰", "desc": "你从冰面上敲了一小块，透明的，里面有气泡。"},
+        {"name": "一片雪节", "desc": "你伸出手，一片雪花落在掌心。还没来得及看清就化了。你又接了一片。。"},
+        {"name": "一块冰", "desc": "你从冰面上敲了一小块，透明的，里面有气泡。。"},
     ],
     "urban": [
-        {"name": "一张车票", "desc": "地上有一张用过的车票。你看了一眼日期，揣进口袋。"},
-        {"name": "一颗扣子", "desc": "路边有一颗扣子，不知道是谁掉的。你捡起来看了看，又放下了，最后还是揣进口袋。"},
+        {"name": "一张车神", "desc": "地上有一张用过的车票。你看了一眼日期，揣进口袋。。"},
+        {"name": "一颗扣子", "desc": "路边有一颗扣子，不知道是谁掉的。你捡起来看了看，又放下了，最后还是揣进口袋。。"},
     ],
     "volcano": [
-        {"name": "一块火山石", "desc": "黑色的火山石，轻得不像石头。表面全是气孔。你把它装进口袋。"},
+        {"name": "一块火山石", "desc": "黑色的火山石，轻得不像石头。表面全是气孔。你把它装进口袋。。"},
     ],
     "grassland": [
-        {"name": "一株草", "desc": "你拔了一株草，根上还带着土。草的味道是苦的。"},
+        {"name": "一株草", "desc": "你拔了一株草，根上还带着土。草的味道是苦的。。"},
     ],
     "tundra": [
-        {"name": "一块苔藓", "desc": "苔藓从石头上剥下来，绿得发黑。湿的，软的。你把它包在纸里。"},
+        {"name": "一块苔藓", "desc": "苔藓从石头上剥下来，绿得发黑。湿的，软的。你把它包在纸里。。"},
     ],
 }
 
@@ -3683,7 +3714,7 @@ def _pick_souvenir(lat: float, lon: float, env: dict, rng: random.Random) -> dic
 
 
 def _filter_ask_hints(sections: list[str]) -> list[str]:
-    """Card 52: remove 'ask 能问出更多' when knowledge layer has no content for the name."""
+    """Card 52: remove 'ask 能问出更大 when knowledge layer has no content for the name."""
     result = []
     for s in sections:
         if "ask 能问出更多" not in s:
@@ -3721,13 +3752,13 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
 
     # Fatigue >9: forced rest
     if _state.fatigue > 9.0:
-        forced_text = "你坐下来了。不是你决定的,是身体决定的。你需要歇一歇。"
+        forced_text = "你坐下来了。不是你决定的是身体决定的。你需要歇一歇。"
         return {"text": forced_text, "data": {"error": "forced_rest", "fatigue": _state.fatigue}}
 
     # ── 1. Parse direction & step ────────────────────────────────────
     bearing, semantic, direction_invalid = _parse_bearing(direction)
 
-    # ── Card 51: toward_sea pre-check — reject if coast > 50 km ────
+    # ── Card 51: toward_sea pre-check  reject if coast > 50 km ────
     if semantic == "toward_sea":
         lat0, lon0 = _state.pos
         sea_km, sea_bearing = walk_mod.nearest_ocean_km_and_bearing(lat0, lon0)
@@ -3737,11 +3768,15 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
         if sea_km is None or sea_km > 50:
             from nowhere.places import _bearing_word as _bw
             dir_str = _bw(sea_bearing) if sea_bearing is not None else "很远"
-            if sea_km is not None and sea_km >= 500:
+            if sea_km is None:
+                # 50km 一5000km 两级扫描都没找到海 走不后dist/dir
+                # 占位符的兜底, 别拼出最近的海在很远公里大
+                reject_text = "往哪边看都还没有海。先走走再说。"
+            elif sea_km >= 500:
                 # Vague text for large distances (Card 51 polish)
                 reject_text = _rng.choice(_FAR_COAST_VARIANTS).format(dir=dir_str)
             else:
-                dist_str = f"{round(sea_km)}" if sea_km is not None else "很远"
+                dist_str = f"{round(sea_km)}"
                 reject_text = _rng.choice(_SEA_REJECT_VARIANTS).format(
                     dist=dist_str, dir=dir_str,
                 )
@@ -3756,7 +3791,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
 
     # Card 50: fatigue>6 caps distance to 3km
     _max_dist = walk_mod._DIST_MAX_FATIGUED if _state.fatigue > 6.0 else walk_mod._DIST_MAX
-    # Card 50: fatigue+slope block — check BEFORE step (step modifies state)
+    # Card 50: fatigue+slope block  check BEFORE step (step modifies state)
     if bearing is not None and _state.pos:
         try:
             _dest = terrain.destination(_state.pos[0], _state.pos[1], bearing, distance_km)
@@ -3771,8 +3806,8 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     _tz_before = _tf.timezone_at(lat=_state.pos[0], lng=_state.pos[1]) if _state.pos else None
     step_result = walk_mod.step(_state, bearing, semantic, distance_km, max_dist=_max_dist)
     # NOTE: time accumulation is handled inside walk.step() using actual
-    # distance and speed — do NOT add time here (would double-count).
-    # Card 64: detect timezone jump (do NOT smooth — borders are real)
+    # distance and speed  do NOT add time here (would double-count).
+    # Card 64: detect timezone jump (do NOT smooth  borders are real)
     _tz_after = _tf.timezone_at(lat=_state.pos[0], lng=_state.pos[1]) if _state.pos else None
 
     # ── Card 51: annotate step_result with water body label ──────────
@@ -3783,13 +3818,13 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
             dest_surface, _lat_now, _lon_now,
         )
 
-    # ── 2. Blocked → render blocked only ─────────────────────────────
+    # ── 2. Blocked ↀrender blocked only ─────────────────────────────
     if step_result.get("blocked"):
         reason = step_result.get("reason", "障碍")
         if reason == "water":
-            # Honest water blocking: "前面是水面,过不去"
+            # Honest water blocking: "前面是水面过不去
             water_dist = step_result.get("water_distance_km", 0)
-            blocked_text = f"前面是水面,过不去。水在{round(water_dist)}公里外。"
+            blocked_text = f"前面是水面过不去。水在{round(water_dist)}公里外。"
         elif reason == "cliff":
             blocked_text = describe.render(
                 "blocked", {"reason": "cliff"}, None, _rng,
@@ -3820,6 +3855,12 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     if step_result.get("lat_limit"):
         from nowhere.walk import _LAT_LIMIT_CLOSINGS
         lat_limit_text = _rng.choice(_LAT_LIMIT_CLOSINGS)
+        # 真实行走的里程在此补记(per-journey + 全局): 提前返回分支
+        # 到不了 Card 20, 不补记会让 lat_limit 移动永久漏账
+        _walked = step_result.get("dist_km", 0.0)
+        if _walked > 0:
+            _state.total_distance_km += _walked
+            placememory.add_distance_km(_walked)
         return {
             "text": lat_limit_text,
             "data": {
@@ -3829,7 +3870,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
             },
         }
 
-    # ── 2c. far_slope: 近处没坡,但高处在远处,先带路 ──────────────────
+    # ── 2c. far_slope: 近处没坡,但高处在远处,先带路──────────────────
     _state.radio_steps_since += 1
     _state.walk_step_counter += 1
     far_note = ""
@@ -3837,18 +3878,18 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
         bearing_deg, gain = step_result["far_slope"]
         from nowhere.places import _bearing_word
 
-        far_note = f"高处在{_bearing_word(bearing_deg)}边,先往那边走。"
+        far_note = f"高处在{_bearing_word(bearing_deg)}边先往那边走。"
 
-    # ── 2d. sea_ahead: 海在前方,鼻子先知道 ───────────────────────────
+    # ── 2d. sea_ahead: 海在前方,鼻子先知道───────────────────────────
     sea_note = ""
     sea_km = step_result.get("sea_ahead_km")
     if sea_km is not None:
         if sea_km <= 3:
-            sea_note = "空气里有咸味了,海就在前面。"
+            sea_note = "空气里有咸味了海就在前面。"
         elif sea_km <= 10:
-            sea_note = f"风里有一丁点咸味——海在 {round(sea_km)} 公里外。"
+            sea_note = f"风里有一丁点咸味——海在{round(sea_km)} 公里外。"
 
-    # Card 64: timezone jump — acknowledge without smoothing
+    # Card 64: timezone jump  acknowledge without smoothing
     _tz_jump_note = ""
     if _tz_before and _tz_after and _tz_before != _tz_after:
         _tz_jump_note = _rng.choice(_TZ_JUMP_VARIANTS)
@@ -3856,7 +3897,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     # ── 3. Gather new point env ──────────────────────────────────────
     lat, lon = _state.pos
     now = _state.now()
-    # Snapshot before cache update — _gather_env_cached overwrites _state.last_env
+    # Snapshot before cache update  _gather_env_cached overwrites _state.last_env
     prev_env = _state.last_env
     # Short-distance mode: skip env fetch, reuse cached (weather/radio unchanged)
     if step_result.get("dist_km", 2.0) < 0.5:
@@ -3945,7 +3986,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     # ── 3.7. Density decay: encounter probability tiers (Card 40) ───
     # Within 30km: normal density
     # 30-100km: encounter probability ×0.5, sparse narrative
-    # >100km wilderness: encounter ×0.2, "荒深档" rendering
+    # >100km wilderness: encounter ×0.2, "荒深桥 rendering
     _wilderness_depth = _state.wilderness_depth_km
     if _wilderness_depth > 100.0:
         _encounter_multiplier = 0.2
@@ -3968,7 +4009,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
         body_texts.append(whim_text)
 
     # ── 5. Salience + describe ───────────────────────────────────────
-    # 留白: 缓存命中且世界没变时,跳过 env 候选举的渲染;encounter 照常 roll
+    # 留白: 缓存命中且世界没变时,跳过 env 候选举的渲染encounter 照常 roll
     sections: list[str] = []
 
     # Inject body texts into sections
@@ -3981,10 +4022,10 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     if souvenir_loss_text:
         sections.append(souvenir_loss_text)
 
-    # ── 4. message/encounter/wilderness → ACTIONS ────────────────────
+    # ── 4. message/encounter/wilderness ↀACTIONS ────────────────────
     _walk_cc = country.country_code_of(lat, lon)  # always available for sanity_check
     if not env_cached:
-        # Card 53: gravity — check if walking near heavy place
+        # Card 53: gravity  check if walking near heavy place
         _heavy_nearby_walk = humanities.is_heavy_place(_state.place_name)
         if not _heavy_nearby_walk:
             _h_probe_w = humanities.nearby_place(lat, lon, set(), _rng)
@@ -4091,10 +4132,10 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
         except ValueError:
             pass  # intentionally ignored: marine_text already removed from sections
 
-    # ── Card 52: filter "ask" hints — only if knowledge layer has content ──
+    # ── Card 52: filter "ask" hints  only if knowledge layer has content ──
     sections = _filter_ask_hints(sections)
 
-    # ── Card 40: 3步空转=世界主动给 (Bethesda 30-second rule) ─────────
+    # ── Card 40: 3步空车世界主动绿(Bethesda 30-second rule) ─────────
     _sections_after_actions = len(sections)
     if _sections_after_actions > _sections_before_actions:
         _state.steps_since_content = 0
@@ -4131,7 +4172,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
 
 
 
-    # 留白: 缓存命中且无任何 section 命中 → 短句直接返回
+    # 留白: 缓存命中且无任何 section 命中 ↀ短句直接返回
     quiet = env_cached and not sections
     ctx.quiet = quiet
 
@@ -4153,9 +4194,10 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
             orig = distance_km
             actual = step_result.get("dist_km", 2.0)
             if actual < orig:
-                prose = "一步最多 5 公里，按 5 公里走了。" + prose
+                # 真实上限可能是疲劳时的3km, 硬编码5 又谎报实走距离是骗人
+                prose = f"一步最大{_max_dist:g} 公里，按 {actual:g} 公里走了。" + prose
             else:
-                prose = "至少走 50 米，按 50 米算了。" + prose
+                prose = "至少走50 米，指50 米算了。" + prose
     # Track recent scene texts for dedup (keep last 5)
     for s in sections:
         if s and len(s) > 10:  # only track substantial texts
@@ -4179,6 +4221,9 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     # ── 7. Post-compose actions (Card 48) ────────────────────────────
     for act in PRE_NORMALIZE_ACTIONS:
         if act.should(ctx):
+            _resolve = getattr(act, "resolve", None)
+            if _resolve:
+                _resolve(ctx)
             t = act.render(ctx)
             if t:
                 prose += f"\n{t}"
@@ -4189,6 +4234,9 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
 
     for act in POST_NORMALIZE_ACTIONS:
         if act.should(ctx):
+            _resolve = getattr(act, "resolve", None)
+            if _resolve:
+                _resolve(ctx)
             t = act.render(ctx)
             if t:
                 prose += f"\n{t}"
@@ -4196,6 +4244,7 @@ async def walk_impl(direction: str = "forward", distance_km: float = 2.0) -> dic
     _state.save()
 
     # Card 20: Accumulate distance in per-journey state + global odometer
+    # (成功路径由调用方记账; 阻挡分支在 walk.step 内记账)
     _walk_dist = step_result.get("dist_km", 2.0)
     if _walk_dist > 0:
         _state.total_distance_km += _walk_dist
@@ -4292,7 +4341,7 @@ async def listen_impl(seconds: int = 10) -> dict:
     }
     sound_text = soundscape.describe_sound(env_for_sound, _rng)
 
-    # Card 19: Dawn chorus hook — replaces sound during -6..0 window
+    # Card 19: Dawn chorus hook  replaces sound during -6..0 window
     _sky_data = (_state.last_env or {}).get("sky", {})
     _sun_alt = _sky_data.get("sun_alt", 99)
     if _sun_alt is None:
@@ -4336,7 +4385,7 @@ async def listen_impl(seconds: int = 10) -> dict:
     # ── 3. Render radio description with analysis data ───────────────
     radio_text = describe.render("radio", station, None, _rng)
 
-    # Describe what we heard — real analysis or genre-based fallback
+    # Describe what we heard  real analysis or genre-based fallback
     sound_detail = ""
     if analysis and analysis.get("analyzed"):
         texture = analysis.get("texture", "smooth")
@@ -4355,7 +4404,7 @@ async def listen_impl(seconds: int = 10) -> dict:
         if rms > 0.3:
             sound_detail += "音量不小。"
     else:
-        # No ffmpeg or stream failed — use genre to paint a picture
+        # No ffmpeg or stream failed  use genre to paint a picture
         genre = (station.get("genre") or "").lower()
         _GENRE_SOUND = {
             "jazz": "萨克斯在绕弯，不着急。烟味从收音机里漏出来——当然没有烟，但你闻到了。",
@@ -4392,7 +4441,7 @@ async def listen_impl(seconds: int = 10) -> dict:
     radio_text = radio_text.rstrip("。") + "。" + sound_detail
 
     if playing:
-        radio_text += f"（正在播放 {seconds} 秒）"
+        radio_text += f"（正在播政{seconds} 秒）"
 
     full_text = sound_text + radio_text
     # Card 21: Append soundscape credit if available
@@ -4436,7 +4485,7 @@ async def look_around_impl() -> dict:
     # ── 1. Start: direction + static observation ───────────────────
     directions = ["东", "南", "西", "北", "东北", "东南", "西北", "西南"]
     direction = _rng.choice(directions)
-    _LOOK_STATIC_VERBS = ["目光投向", "视线落在", "你看向", "你望向", "你面朝"]
+    _LOOK_STATIC_VERBS = ["目光投向", "视线落在", "你看向", "你望向", "你面向"]
     verb = _rng.choice(_LOOK_STATIC_VERBS)
     sections.append(f"{verb}{direction}方。")
 
@@ -4517,9 +4566,15 @@ async def look_around_impl() -> dict:
         _BIOME_RADIUS = {"city": 2, "mountain": 10, "volcano": 10, "island": 8, "coast": 8}
         radius = _BIOME_RADIUS.get(_state.biome or "", 15)
         current_month = now.month if now else None
-        life_result = await asyncio.wait_for(life.nearby(lat, lon, night=night, weather_text=weather_text,
-                                        radius_km=radius, biome=_state.biome, rng=_rng,
-                                        month=current_month), timeout=10.0)
+        try:
+            life_result = await asyncio.wait_for(life.nearby(lat, lon, night=night, weather_text=weather_text,
+                                            radius_km=radius, biome=_state.biome, rng=_rng,
+                                            month=current_month), timeout=10.0)
+        except Exception as exc:
+            # iNat 是联网调用 超时/解析失败都按"没看到动物降级",
+            # 不让 look_around 整体失败(本文件其余网络调用同此风树
+            logger.warning("life.nearby failed: %s", exc)
+            life_result = None
         d = life_result.get("distance_m") if life_result else None
         if life_result and d is not None and d < 3000:
             placememory.record_sighting(
@@ -4546,7 +4601,12 @@ async def look_around_impl() -> dict:
         mood = (_state.last_env or {}).get("weather", {}).get("precip", "calm")
         if not mood or mood.lower() in ("none", ""):
             mood = "calm"
-        art_result = await asyncio.wait_for(art.match(lat, lon, mood, _rng), timeout=10.0)
+        try:
+            art_result = await asyncio.wait_for(art.match(lat, lon, mood, _rng), timeout=10.0)
+        except Exception as exc:
+            # Met API(可能两次串行搜索)失败同样指没遇到降级
+            logger.warning("art.match failed: %s", exc)
+            art_result = None
         if art_result:
             sections.append(describe.render("art", art_result, None, _rng))
 
@@ -4565,7 +4625,7 @@ async def look_around_impl() -> dict:
         if isinstance(msg, dict):
             msg["encountered"] = True
         msg_content = _strip_code_markers(str(msg_content))
-        sections.append(f"有人在这里留了句话：「{msg_content}」")
+        sections.append(f"有人在这里留了句话：「{msg_content}。")
 
     # ── 9. Ending: static closing (no movement verbs) ──────────────
     _LOOK_CLOSINGS = [
@@ -4588,18 +4648,18 @@ async def look_around_impl() -> dict:
 
 @_serialized_action
 async def wait_impl(hours: float = 1.0) -> dict:
-    """原地待着,让时间流过去。
+    """原地待着,让时间流过去。"
 
-    - hours ≤ 12: 逐小时感知（原有模式）
-    - hours > 12: "长待"模式，按天出摘要，上限720小时（30天）
-    - 任何钳制都在文本里明说，不静默改数
+    - hours ≀12: 逐小时感知（原有模式）"",
+    - hours > 12: "长待"模式，按天出摘要，上附20小时）",0天）
+    - 任何钳制都在文本里明说，不静默改教
     """
     global _state, _rng
 
     if _state.pos is None:
         return {"text": "还没开门呢。先开门吧。", "data": {"error": "not_landed"}}
 
-    # ── 钳制：上限720h（30天），下限0.25h ────────────────────────────
+    # ── 钳制：上附20h）",0天），下附.25h ────────────────────────────
     _MAX_WAIT = 720.0
     raw_hours = hours
     hours = max(0.25, min(hours, _MAX_WAIT))
@@ -4611,7 +4671,7 @@ async def wait_impl(hours: float = 1.0) -> dict:
     if _state.now() is not None:
         _start_sim_date = _state.now().astimezone(ZoneInfo("Asia/Shanghai")).date()
 
-    # ── 长待模式（>12小时）───────────────────────────────────────────
+    # ── 长待模式）",12小时）───────────────────────────────────────────
     if hours > 12.0:
         days = int(hours // 24)
         leftover = hours - days * 24
@@ -4718,7 +4778,7 @@ async def wait_impl(hours: float = 1.0) -> dict:
     prev_env = _state.last_env
     start_temp = (prev_env or {}).get("weather", {}).get("temp_c")
     last_reported_temp = start_temp  # track to avoid repeating the same message
-    quiet = True  # 留白: 全程缓存命中且世界没变
+    quiet = True  # 留白: 全程缓存命中且世界没口
     # Card 50: detect if waiting indoors (building/urban and not raining)
     _is_indoor = _state.biome == "city" and (prev_env or {}).get("weather", {}).get("precip", "none") != "storm"
     remaining_hours = hours
@@ -4754,7 +4814,7 @@ async def wait_impl(hours: float = 1.0) -> dict:
             line = _phase_lines.get((prev_phase, curr_phase), f"天色变了。")
             sections.append(line)
 
-        # Temperature change (report only when delta from last reported ≥ 3)
+        # Temperature change (report only when delta from last reported ≀3)
         curr_temp = env.get("weather", {}).get("temp_c")
         if last_reported_temp is not None and curr_temp is not None:
             delta = round(curr_temp - last_reported_temp)
@@ -4773,14 +4833,14 @@ async def wait_impl(hours: float = 1.0) -> dict:
             _wait_avail.remove(_picked)
             sections.append(_picked)
 
-        # Card 42: letter in pack → 10% weight mention during wait
+        # Card 42: letter in pack ↀ10% weight mention during wait
         if _state.errand and _state.errand.get("kind") == "letter" and _rng.random() < 0.10:
             sections.append(errands.letter_wait_text(_rng))
 
         prev_env = env
         h += 1
 
-    # Card 66: 节日穿越 — wait跨入节日窗口时触发
+    # Card 66: 节日穿越  wait跨入节日窗口时触口
     _festival_cross_text = None
     if _start_sim_date is not None:
         _end_now = _state.now()
@@ -4792,7 +4852,7 @@ async def wait_impl(hours: float = 1.0) -> dict:
                     _state.place_name or "", cc, lat, _end_now, _rng, lon=lon
                 )
 
-    # 留白: 缓存命中且世界没变 → 不再逐项描述
+    # 留白: 缓存命中且世界没口ↀ不再逐项描述
     if quiet:
         text = _rng.choice(_QUIET_WAIT)
     else:
@@ -4812,9 +4872,9 @@ async def wait_impl(hours: float = 1.0) -> dict:
             total_delta = round(final_temp - start_temp)
             if abs(total_delta) >= 3:
                 if total_delta < 0:
-                    sections.append(f"气温从 {round(start_temp)} 度降到了 {round(final_temp)} 度。凉意从脚底往上走。")
+                    sections.append(f"气温从{round(start_temp)} 度降到了 {round(final_temp)} 度。凉意从脚底往上走。")
                 else:
-                    sections.append(f"气温从 {round(start_temp)} 度升到了 {round(final_temp)} 度。空气热了。")
+                    sections.append(f"气温从{round(start_temp)} 度升到了 {round(final_temp)} 度。空气热了。")
 
         if not sections:
             sections.append("时间从身上流过去。世界没怎么变。你还在原地。")
@@ -4888,7 +4948,7 @@ async def ask_impl(topic: str) -> dict:
         if _state.place_name:
             result = await asyncio.wait_for(knowledge.about(lat, lon, _state.place_name), timeout=10.0)
     if not result and topic:
-        # Try place_name + topic combination (e.g. "京都 金阁寺")
+        # Try place_name + topic combination (e.g. "京都 金阁寺)
         if _state.place_name and _state.place_name not in topic:
             result = await asyncio.wait_for(knowledge.about(lat, lon, f"{_state.place_name} {topic}"), timeout=10.0)
     if not result:
@@ -4924,7 +4984,7 @@ async def walk_to_impl(place: str) -> dict:
     dist = target.get("distance_km", 0)
     bearing = target.get("bearing", "")
 
-    # 水域名称 geocoding 经常返回很远的点（河流源头/入海口），
+    # 水域名称 geocoding 经常返回很远的点（河流源大入海口））"",
     # 尝试从离线水文库找更近的同名水域
     if dist > 50:
         closer = _find_nearest_water_feature(place, _state.pos[0], _state.pos[1])
@@ -4964,7 +5024,7 @@ async def walk_to_impl(place: str) -> dict:
     ]
     lines.append(_rng.choice(_depart_templates))
 
-    # ── 走路：关键节点叙事 ───────────────────────────────────────────
+    # ── 走路：关键节点叙了───────────────────────────────────────────
     steps = 0
     total_km = 0.0
     max_steps = max(3, min(10, int(dist / 5) + 1))
@@ -5009,7 +5069,7 @@ async def walk_to_impl(place: str) -> dict:
             _state.seen_humanities.add(h_card["key"])
             lines.append(h_card["text"])
 
-        # 每2-3步加一句旅程叙事
+        # 比-3步加一句旅程叙了
         if steps % 3 == 0:
             _distance_lines = [
                 f"又走了一段路。",
@@ -5032,7 +5092,7 @@ async def walk_to_impl(place: str) -> dict:
         ]
         lines.append(_rng.choice(_arrival_templates))
 
-        # 人文卡触发
+        # 人文卡触口
         if humanities.has_place(place):
             arr_card = humanities.draw(place, _state.seen_humanities, _rng)
             if arr_card:
@@ -5043,11 +5103,11 @@ async def walk_to_impl(place: str) -> dict:
 
         arrived = True
     else:
-        lines.append(f"还没走到。还剩 {round(remaining)} 公里。你站在原地看了一会儿，{place}在{bearing}边。")
+        lines.append(f"还没走到。还前{round(remaining)} 公里。你站在原地看了一会儿，{place}在{bearing}边。")
         arrived = False
 
-    # ── 更新状态 ─────────────────────────────────────────────────────
-    # NOTE: time accumulation is handled inside walk.step() per step — do NOT add here.
+    # ── 更新状总─────────────────────────────────────────────────────
+    # NOTE: time accumulation is handled inside walk.step() per step  do NOT add here.
     now = _state.now()
     lat, lon = _state.pos
     env, _ = await _gather_env_cached(lat, lon, now)
@@ -5094,7 +5154,7 @@ def mark_impl(name: str, note: str = "", overwrite: bool = False) -> dict:
     except ValueError:
         existing = marks_mod.get(name)
         return {
-            "text": f"「{name}」已经标过了。要覆盖的话用 mark 的覆盖选项。",
+            "text": f"「{name}」已经标过了。要覆盖的话用mark 的覆盖选项。",
             "data": {"error": "duplicate", "existing": existing},
         }
     text = f"已标记「{name}」。"
@@ -5137,7 +5197,7 @@ def where_am_i_impl() -> dict:
         if _elev and _elev > 2:
             parts.append(f"海拔 {_elev:.0f} 米。")
     else:
-        parts.append(f"走了 {len(_state.path)} 步,出门 {_state.elapsed_hours:.1f} 小时。")
+        parts.append(f"走了 {len(_state.path)} 步出门 {_state.elapsed_hours:.1f} 小时。")
     if utc_now:
         # Convert to local time using timezonefinder
         tz_name = _tf.timezone_at(lat=lat, lng=lon)
@@ -5168,7 +5228,7 @@ def where_am_i_impl() -> dict:
     # Card 20: Odometer (per-journey)
     total_km = _state.total_distance_km
     if total_km >= 1.0:
-        parts.append(f"这趟出门,你已经走了 {total_km:.0f} 公里。")
+        parts.append(f"这趟出门,你已经走了{total_km:.0f} 公里。")
     elif total_km > 0:
         parts.append("还没走出一条街。")
 
@@ -5194,24 +5254,24 @@ def _clamp_coastal_elevation(elev: float, surface: str, lat: float, lon: float) 
     """Coarse-grid (1°) coastline cells produce garbage elevations.
 
     Root cause: grid_tiny merges land and ocean in the same 1° cell;
-    the averaged elevation can be wildly off — e.g. Weihai reports 300 m
+    the averaged elevation can be wildly off  e.g. Weihai reports 300 m
     while sitting at sea level.  Same disease as card 26.
 
     Diagnostic signal: if all 8 grid neighbours share the exact same
-    elevation, the grid has no real terrain data for this cell — it is
+    elevation, the grid has no real terrain data for this cell  it is
     a coarse default (typically 200-300 m).  Real terrain (even flat
     plains) always shows some variation at 1° resolution.
 
     Strategy:
-    1. Water surface → always near sea level (0-5 m).
-    2. High-res tile available → trustworthy, skip.
-    3. Flat neighbours on coarse grid → elevation is a grid artifact.
+    1. Water surface ↀalways near sea level (0-5 m).
+    2. High-res tile available ↀtrustworthy, skip.
+    3. Flat neighbours on coarse grid ↀelevation is a grid artifact.
        Look up the nearest large city in cities15000: if within 30 km,
        use its population as a proxy for "this is a significant place
        where the coarse grid is misleading".  Clamp to 0-50 m.
-    4. Otherwise → leave untouched (preserves Denver, Lhasa, etc.).
+    4. Otherwise ↀleave untouched (preserves Denver, Lhasa, etc.).
 
-    Trade-off: this also clamps some inland cities (Moscow ~156 m → 50 m)
+    Trade-off: this also clamps some inland cities (Moscow ~156 m ↀ50 m)
     when the grid provides no real terrain data.  Proper fix is high-res
     SRTM tiles for all major cities (card 26).
     """
@@ -5219,11 +5279,11 @@ def _clamp_coastal_elevation(elev: float, surface: str, lat: float, lon: float) 
     if surface in ("water_ocean", "water_fresh", "wetland"):
         return max(0.0, min(elev, 5.0))
 
-    # High-res tile available → data is trustworthy, skip clamping
+    # High-res tile available ↀdata is trustworthy, skip clamping
     if terrain._find_tile(lat, lon) is not None:
         return elev
 
-    # Check if all 8 grid neighbours have the same elevation —
+    # Check if all 8 grid neighbours have the same elevation  
     # this indicates the 1° grid has no real terrain data.
     step = 1.0
     neighbour_elevs: set[float] = set()
@@ -5235,7 +5295,7 @@ def _clamp_coastal_elevation(elev: float, surface: str, lat: float, lon: float) 
     is_flat_grid = len(neighbour_elevs) == 1
 
     if not is_flat_grid:
-        # Real terrain variation — elevation is meaningful
+        # Real terrain variation  elevation is meaningful
         return elev
 
     # Flat grid: elevation is a coarse default.  Check if a significant
@@ -5263,7 +5323,7 @@ def _clamp_coastal_elevation(elev: float, surface: str, lat: float, lon: float) 
                     dlon += 360
                 dist_km = 111.0 * math.sqrt(dlat ** 2 + (dlon * cos_lat) ** 2)
                 if dist_km < 30:
-                    # Significant city on flat-grid cell → clamp
+                    # Significant city on flat-grid cell ↀclamp
                     return max(0.0, min(elev, 50.0))
     except Exception:
         logger.debug("_clamp_coastal_elevation lookup failed", exc_info=True)
@@ -5375,7 +5435,7 @@ def _pick_best_localized(
                 return False
 
         if script == "hangul":
-            # Skip long compound names (서울특별시, 한양 etc.)
+            # Skip long compound names (서울특별싀 한양 etc.)
             if n > 6:
                 return False
 
@@ -5407,7 +5467,7 @@ def _pick_best_localized(
             return accented[0]
 
     # For Devanagari: prefer names matching ASCII first syllable
-    # (Mumbai → मुंबई over बम्बई; Delhi → दिल्ली)
+    # (Mumbai ↀमुंबऀover बम्बऀ Delhi ↀदिल्ली)
     if script == "devanagari" and filtered:
         if ascii_name.lower().startswith("mu"):
             mu_names = [a for a in filtered if a.startswith("मु")]
@@ -5415,15 +5475,15 @@ def _pick_best_localized(
                 return mu_names[0]
 
     # For Hangul: prefer names matching ASCII first syllable
-    # (Seoul → 서울 over 경성; Busan → 부산)
+    # (Seoul ↀ서울 over 경성; Busan ↀ부삀
     if script == "hangul" and filtered:
-        # Prefer the2-char "clean" name (서울, 부산) over compounds
+        # Prefer the2-char "clean" name (서울, 부삀 over compounds
         short = [a for a in filtered if len(a) == 2]
         if short:
-            # Match first syllable: ASCII "Se" → "서", "Bu" → "부"
+            # Match first syllable: ASCII "Se" ↀ"섀",  "Bu" ↀ"부"
             _HANGUL_INIT = {
                 "se": "서", "bu": "부", "in": "인", "da": "대", "gw": "광",
-                "je": "제", "ch": "천", "su": "수", "ul": "울", "gy": "경",
+                "je": "제", "ch": "춘", "su": "수", "ul": "울", "gy": "경",
             }
             prefix = ascii_name.lower()[:2]
             expected_init = _HANGUL_INIT.get(prefix)
@@ -5454,10 +5514,10 @@ def _localized_place_name(place_name: str, lat: float, lon: float) -> str:
     1. Find the nearest city entry matching ``place_name``.
     2. Determine target script from country code.
     3. Pick the best alternename in that script.
-    4. Fallback chain: target-script alt → CJK alt → romanised name.
+    4. Fallback chain: target-script alt ↀCJK alt ↀromanised name.
 
     For China/HK/TW/JP: place_name itself is already CJK, pass through.
-    For all other countries: return local script (東京/Москва/القاهرة…).
+    For all other countries: return local script (東京/Москва/القاهرة .
     Romanised fallback is normal for foreign postcards; Chinese stamp on
     a Tokyo postcard is the real bug.
     """
@@ -5468,7 +5528,7 @@ def _localized_place_name(place_name: str, lat: float, lon: float) -> str:
     if key in _local_name_cache:
         return _local_name_cache[key]
 
-    # CJK input in CJK-speaking region → already correct, pass through.
+    # CJK input in CJK-speaking region ↀalready correct, pass through.
     # JP needs lookup (simplified→traditional), handled below.
     cc = country.country_code_of(lat, lon)
     if cc in ("CN", "TW", "HK", "MO") and _has_cjk(place_name):
@@ -5540,7 +5600,7 @@ def _localized_place_name(place_name: str, lat: float, lon: float) -> str:
     admin1 = best_entry.get("admin1", "")
 
     # Classify alternates by script.
-    # An alt is assigned to a script only if ≥60% of non-space, non-punctuation
+    # An alt is assigned to a script only if ≀0% of non-space, non-punctuation
     # characters belong to that script.  This filters out transliterations
     # like "Məskəү" (1 Cyrillic char among 6 Latin).
     script_groups: dict[str, list[str]] = {}
@@ -5557,7 +5617,7 @@ def _localized_place_name(place_name: str, lat: float, lon: float) -> str:
         if not total_alpha:
             continue
         dominant = max(counts, key=lambda k: counts[k])
-        # Require ≥60% dominance (filters mixed-script transliterations)
+        # Require ≀0% dominance (filters mixed-script transliterations)
         if counts[dominant] / total_alpha >= 0.6:
             script_groups.setdefault(dominant, []).append(alt)
 
@@ -5568,7 +5628,7 @@ def _localized_place_name(place_name: str, lat: float, lon: float) -> str:
         if s != "other":
             input_scripts.add(s)
 
-    # Country → target script
+    # Country ↀtarget script
     target_info = _COUNTRY_TO_SCRIPT.get(e_cc)
     target_script = target_info[0] if target_info else None
 
@@ -5594,7 +5654,7 @@ def _localized_place_name(place_name: str, lat: float, lon: float) -> str:
 
 def _postmark(lat: float, lon: float) -> dict:
     """邮戳保留旅程内当地时间；现实寄出时间由明信片另行记录。"""
-    # Always use terrain module for stamp elevation — last_env elevation
+    # Always use terrain module for stamp elevation  last_env elevation
     # comes from the coarse grid which can be wildly off for coastal cities
     # (e.g. Weihai reports 300 m while sitting at sea level).  The terrain
     # module checks DEM tiles first, which is more accurate.
@@ -5727,33 +5787,45 @@ def _generate_return(
 
     # Even if same season, mention elapsed time if > 1 day
     if elapsed.days > 0:
-        return f"你离开了 {elapsed.days} 天。世界没有停。"
+        return f"你离开了{elapsed.days} 天。世界没有停。"
 
     return ""
 
 
-def _poster_front_async(card: dict, lat: float, lon: float) -> None:
-    """后台线程生成明信片正面海报。可选增强,没有 osmnx 就安静缺席。"""
+def _poster_front_async(card: dict, lat: float, lon: float, biome: str = "") -> None:
+    """后台线程生成明信片正面海报。可选增开没有 osmnx 就安静缺席。"
+
+    线程只负责生成图片文从 card dict 一placememory 的合并投递回事件
+    循环、在 _action_lock 内完成— daemon 线程直接改共了card 并写直
+    会撞上主线程正在进行的_state.save() 序列化。"
+    """
     if not poster.available():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
         return
 
     def _job() -> None:
         out = poster.OUT_DIR / f"card_{card['id']}.png"
-        dist = 6000 if _state.biome == "city" else 15000
+        dist = 6000 if biome == "city" else 15000
         ok = asyncio.run(poster.generate(lat, lon, card["stamp"]["place"], out, distance=dist))
         if not ok:
-            # 无路荒野: 没有路,就是那里的样子
+            # 无路荒野: 没有路就是那里的样子
             surf = card["stamp"].get("surface", "")
             ok = poster.blank(out, card["stamp"]["place"], lat, lon, surface=surf)
         if ok:
-            card["front_img"] = f"/static/postcards/card_{card['id']}.png"
-            placememory.update_postcard(card)
+            async def _merge() -> None:
+                async with _action_lock:
+                    card["front_img"] = f"/static/postcards/card_{card['id']}.png"
+                    placememory.update_postcard(card)
+            asyncio.run_coroutine_threadsafe(_merge(), loop)
 
     threading.Thread(target=_job, daemon=True).start()
 
 
 def send_postcard_impl(text: str) -> dict:
-    """寄一张明信片回家。字是 AI 自己的,邮戳是世界的。"""
+    """寄一张明信片回家。字是AI 自己的邮戳是世界的。"""
     global _state, _postcard_counter
 
     if _state.pos is None:
@@ -5762,9 +5834,9 @@ def send_postcard_impl(text: str) -> dict:
     if not text:
         return {"text": "空白的明信片寄不出去。", "data": {"error": "empty"}}
     if len(text) > 1000:
-        return {"text": "明信片写不下了,短一点。", "data": {"error": "too_long"}}
+        return {"text": "明信片写不下了短一点。", "data": {"error": "too_long"}}
 
-    # id 取 进程计数 和 落盘最大id 的较大者——多进程/重启不撞号
+    # id 口进程计数 和落盘最大id 的较大者——多进程/重启不撞口
     file_max = max((c.get("id") or 0 for c in placememory.postcards()), default=0)
     _postcard_counter = max(_postcard_counter, file_max) + 1
     lat, lon = _state.pos
@@ -5774,13 +5846,13 @@ def send_postcard_impl(text: str) -> dict:
         "stamp": _postmark(lat, lon),
         "sent_at": datetime.now(timezone.utc).isoformat(),
         "replies": [],
-        "front_img": None,  # 异步生成,好了挂上;没有就前端 SVG 兜底
+        "front_img": None,  # 异步生成,好了挂上;没有就前站SVG 兜底
     }
     _state.postcards.append(card)
-    placememory.save_postcard(card)  # 落盘: 文件是真相,网页旁观者看得见
+    placememory.save_postcard(card)  # 落盘: 文件是真直网页旁观者看得见
     _record_footprint("postcard", text)
     _state.save()
-    _poster_front_async(card, lat, lon)
+    _poster_front_async(card, lat, lon, biome=_state.biome or "")
 
     s = card["stamp"]
 
@@ -5791,11 +5863,11 @@ def send_postcard_impl(text: str) -> dict:
     weather_text = s.get("weather", "")
     temp = s.get("temp_c", "")
 
-    # Card 57: 正面优先用旅程已见卡的环境句——明信片长在这次旅程上
+    # Card 57: 正面优先用旅程已见卡的环境句——明信片长在这次旅程一
     import hashlib as _hashlib
     journey_front: str | None = None
 
-    # 1) 从 localcolor 已见卡的 text 里挑一句环境描写
+    # 1) 从localcolor 已见卡的 text 里挑一句环境描冰
     place = _state.place_name
     if place:
         _lc_cards = localcolor._load()
@@ -5807,14 +5879,14 @@ def send_postcard_impl(text: str) -> dict:
         if seen_texts:
             idx = int(_hashlib.md5(f"postcard_{card['id']}".encode()).hexdigest()[:4], 16) % len(seen_texts)
             candidate = seen_texts[idx]
-            # 取第一句(不超 60 字),太长截断
+            # 取第一口不超 60 子,太长截断
             first_sent = candidate.split("。")[0].split("\n")[0].strip()
             if len(first_sent) > 60:
                 first_sent = first_sent[:58] + "……"
             if first_sent:
                 journey_front = first_sent + "。"
 
-    # 2) 没有已见卡 → 用当前环境实况拼一句画面
+    # 2) 没有已见十ↀ用当前环境实况拼一句画面
     if journey_front is None:
         env = _state.last_env or {}
         env_parts: list[str] = []
@@ -5822,7 +5894,7 @@ def send_postcard_impl(text: str) -> dict:
             env_parts.append(weather_text)
         if surface and surface not in ("urban",):
             _SURFACE_WORD = {
-                "forest": "林子里", "rock": "岩壁下", "sand": "沙地上",
+                "forest": "林子里", "rock": "岩壁上", "sand": "沙地上",
                 "grass": "草地上", "snow": "雪地里", "ice": "冰面上",
                 "bare": "碎石地上", "water_ocean": "海边", "water_fresh": "水边",
                 "wetland": "湿地里",
@@ -5831,21 +5903,21 @@ def send_postcard_impl(text: str) -> dict:
             if sw:
                 env_parts.append(sw)
         if env_parts:
-            journey_front = "、".join(env_parts) + "。"
+            journey_front = "。".join(env_parts) + "。"
 
-    # 3) 全兜底: 地表固定池(从未见过的新地方)
+    # 3) 全兜底 地表固定江从未见过的新地方)
     surface_snapshots: dict[str, list[str]] = {
-        "forest": ["树冠挨着树冠,绿的深浅分了好几层。阳光从叶子缝里漏下来,在地上碎成金点。","树一层一层地叠上去,深绿压着浅绿。林间有雾,薄薄的一层。","一棵老树横在画面里,树干上长满了蕨。"],
+        "forest": ["树冠挨着树冠,绿的深浅分了好几层。阳光从叶子缝里漏下来在地上碎成金点。","树一层一层地叠上去深绿压着浅绿。林间有雨薄薄的一层。","一棵老树横在画面里树干上长满了蕨。"],
         "urban": ["房子挤着房子,阳台上的衣服在风里晃。远处有楼的轮廓。","窗台上摆着一盆花,不知道什么品种。叶子在风里动了一下。"],
-        "rock": ["石头黑着脸,裂缝里长着苔。风把岩石磨出了棱角。","一整面岩壁,纹理像水流的化石。上面有几道鸟粪的白痕。","碎石坡,大的小的挤在一起。有一块被晒得发白。"],
-        "sand": ["沙丘的脊线像刀切的。风吹过,沙面上起了一层细纹。","沙漠,沙丘一道一道,像凝固的浪。天边和沙是一个颜色。","近处是一丛骆驼刺,根扎得很深。远处的沙丘上没有人。"],
-        "grass": ["草一直铺到天边,风吹过来的时候,草叶一层层地伏下去。这边的绿比别处浅。","及腰的草,风过的时候翻出银色的背面。远处有一棵孤树。","草海上起了浪——风推着草,一波一波地往前走。"],
-        "snow": ["白连成一片,没有边。只有一道风刮过的痕,像梳子梳的。","雪地上有一串脚印,歪歪扭扭地往远处去。不知道是人的还是动物的。","新雪盖在旧雪上,阳光下亮得晃眼。远处的山脊是一条白线。"],
-        "ice": ["冰面亮得晃眼。裂缝里能看到冰层的蓝——不是天的蓝,是比天更深的蓝。","冰在脚下铺开,一直铺到天边。有几处冰裂了,裂缝里的水是黑的。"],
+        "rock": ["石头黑着脚裂缝里长着苔。风把岩石磨出了棱角。","一整面岩壁,纹理像水流的化石。上面有几道鸟粪的白痕。","碎石块大的小的挤在一起。有一块被晒得发白。"],
+        "sand": ["沙丘的脊线像刀切的。风吹过,沙面上起了一层细纹。","沙漠,沙丘一道一道像凝固的浪。天边和沙是一个颜色。","近处是一丛骆驼刺,根扎得很深。远处的沙丘上没有人。"],
+        "grass": ["草一直铺到天边风吹过来的时候草叶一层层地伏下去。这边的绿比别处浅。","及腰的草,风过的时候翻出银色的背面。远处有一棵孤树。","草海上起了浪——风推着草一波一波地往前走。"],
+        "snow": ["白连成一片没有边。只有一道风刮过的痕,像梳子梳的。","雪地上有一串脚十歪歪扭扭地往远处去。不知道是人的还是动物的。","新雪盖在旧雪一阳光下亮得晃眼。远处的山脊是一条白线。"],
+        "ice": ["冰面亮得晃眼。裂缝里能看到冰层的蓝——不是天的蓝,是比天更深的蓝。","冰在脚下铺开,一直铺到天边。有几处冰裂了裂缝里的水是黑的。"],
         "bare": ["碎石铺到天边。近处有几块石头被风磨圆了。","戈壁上什么也没有,地平线直得像用尺子画的。"],
-        "water_ocean": ["水一直铺到天边。浪不大,一层一层地推上来又退下去。","海平线把画面切成两半——上面是天,下面是水,中间一条直线。"],
-        "water_fresh": ["水面平着,光在上面碎成一片。岸边有几丛芦苇。","湖水倒映着天,比天还蓝。"],
-        "wetland": ["水草相间。一只鸟贴着水面飞,翅膀尖点了一下水,涟漪一圈圈散开。"],
+        "water_ocean": ["水一直铺到天边。浪不大,一层一层地推上来又退下去。","海平线把画面切成两半——上面是大下面是水,中间一条直线。"],
+        "water_fresh": ["水面平着,光在上面碎成一片。岸边有几丛芦苇。","湖水倒映着大比天还蓝。"],
+        "wetland": ["水草相间。一只鸟贴着水面风翅膀尖点了一下水,涟漪一圈圈散开。"],
     }
     if journey_front is None:
         surface_choices = surface_snapshots.get(surface, surface_snapshots["bare"])
@@ -5856,7 +5928,7 @@ def send_postcard_impl(text: str) -> dict:
     # ── 背面邮戳 ──────────────────────────────────────────────────────
     lat_dir = "北纬" if s["lat"] >= 0 else "南纬"
     lon_dir = "东经" if s["lon"] >= 0 else "西经"
-    # Card 57: RTL文字(阿拉伯/希伯来)单独一行,不与拉丁混排
+    # Card 57: RTL文字(阿拉伯希伯来单独一街不与拉丁混排
     _RTL_RANGES = (
         (0x0590, 0x05FF),  # Hebrew
         (0x0600, 0x06FF),  # Arabic
@@ -5871,37 +5943,37 @@ def send_postcard_impl(text: str) -> dict:
     )
     if is_rtl:
         stamp_describe = (
-            f"明信片正面: {front_image} "
-            f"翻过来,邮戳是圆的,印着——"
+            f"明信片正面 {front_image} "
+            f"翻过来邮戳是圆的印着——"
             f"\n{place_text}"
             f"\n{lat_dir}{abs(s['lat']):.1f}°,{lon_dir}{abs(s['lon']):.1f}°。"
             f"海拔{elev}米。{s['local_time']}。"
         )
     else:
         stamp_describe = (
-            f"明信片正面: {front_image} "
-            f"翻过来,邮戳是圆的,印着——"
+            f"明信片正面 {front_image} "
+            f"翻过来邮戳是圆的印着——"
             f"{place_text}。{lat_dir}{abs(s['lat']):.1f}°,{lon_dir}{abs(s['lon']):.1f}°。"
             f"海拔{elev}米。{s['local_time']}。"
         )
-    # Card 57: 中文名括注(背面小字)
+    # Card 57: 中文名括法背面小字)
     zh_name = s.get("place_zh")
     if zh_name and zh_name != place_text:
         stamp_describe += f"({zh_name})"
 
-    # ── Card 42: 邮差差事 — 寄完明信片 10% 拿到一封信 ────────────
+    # ── Card 42: 邮差差事  寄完明信物10% 拿到一封信 ────────────
     if (not _state.errand
             and not _state.errand_letter_taken_this_journey
             and _rng.random() < 0.10):
-        _llat, _llon = _state.pos if _state.pos else (0.0, 0.0)
+        _llat, _llon = _state.pos if _state.pos else (None, None)
         letter = errands.pick_letter(_rng, listener_lat=_llat, listener_lon=_llon)
         if letter:
             _state.errand = errands.take_letter(letter, _state.now() or datetime.now(timezone.utc))
             _state.errand_letter_taken_this_journey = True
             _state.save()
             stamp_describe += (
-                f"\n寄完明信片,柜台后面的人递过来一封信。"
-                f"「给{letter['recipient']}的。{letter['sender']}托的。」"
+                f"\n寄完明信物柜台后面的人递过来一封信。"
+                f"「给{letter['recipient']}的。{letter['sender']}托的。。"
                 f"你把信揣进包里。"
             )
 
@@ -5909,9 +5981,9 @@ def send_postcard_impl(text: str) -> dict:
 
 
 def reply_postcard_impl(card_id: int, content: str) -> dict:
-    """人类回话(网页用): 记到明信片上,也进留言池让 AI 路上捡到。
+    """人类回话(网页用: 记到明信片上,也进留言池让 AI 路上捡到。"
 
-    内存和落盘文件两条路都试——卡可能是别的进程寄的。
+    内存和落盘文件两条路都试——卡可能是别的进程寄的。"
     """
     global _state
     for card in _state.postcards:
@@ -5938,8 +6010,8 @@ async def open_door(to: str | None = None, blind: bool = False, key: str | None 
     """Open the door.  No arg = random landing; pass a place name or bookmark name.
     blind=True: hide place name (guess to reveal).
     key="...": deterministic landing by key (same key = same place).
-    intent biases what you see (e.g. "吃" boosts food, "孤独" boosts quiet).
-    Append " 新" to place name (e.g. "拉萨 新") to force a fresh landing,
+    intent biases what you see (e.g. "后 boosts food, "孤独" boosts quiet).
+    Append " 斯 to place name (e.g. "拉萨 斯) to force a fresh landing,
     creating a new journey even if one already exists for that place.
     """
     return await open_door_impl(to, blind=blind, key=key, intent=intent)
@@ -5976,9 +6048,9 @@ async def ask(topic: str) -> dict:
 
 
 @mcp.tool()
-def mark(name: str, note: str = "", overwrite: bool = False) -> dict:
+async def mark(name: str, note: str = "", overwrite: bool = False) -> dict:
     """Save your current position as a named bookmark."""
-    return mark_impl(name, note, overwrite)
+    return await _run_serialized(mark_impl, name, note, overwrite)
 
 
 @mcp.tool()
@@ -6006,19 +6078,21 @@ def souvenir() -> dict:
 
 
 @mcp.tool()
-def give_souvenir() -> dict:
+async def give_souvenir() -> dict:
     """把身上的东西放下（留给下一个人，或放回原处）。"""
-    if _state.souvenir is None:
-        return {"text": "身上什么都没有。", "data": {"error": "empty"}}
-    s = _state.souvenir
-    _state.souvenir = None
-    return {"text": f"你把{ s['name']}放在了路边。也许会有人捡到。", "data": {"dropped": s}}
+    def _impl() -> dict:
+        if _state.souvenir is None:
+            return {"text": "身上什么都没有。", "data": {"error": "empty"}}
+        s = _state.souvenir
+        _state.souvenir = None
+        return {"text": f"你把{ s['name']}放在了路边。也许会有人捡到。", "data": {"dropped": s}}
+    return await _run_serialized(_impl)
 
 
 @mcp.tool()
-def bury(note: str | None = None) -> dict:
+async def bury(note: str | None = None) -> dict:
     """把身上的东西埋在当前坐标。可以留一句话。"""
-    return bury_impl(note)
+    return await _run_serialized(bury_impl, note)
 
 
 def bury_impl(note: str | None = None) -> dict:
@@ -6032,7 +6106,7 @@ def bury_impl(note: str | None = None) -> dict:
     s = _state.souvenir
     sanitized_note = ""
     if note:
-        sanitized_note = _sanitize_external(note).strip("「」")
+        sanitized_note = _sanitize_external(note).strip("「。")
 
     entry = {
         "name": s.get("name", ""),
@@ -6054,9 +6128,9 @@ def bury_impl(note: str | None = None) -> dict:
 
 
 @mcp.tool()
-def deliver() -> dict:
-    """送达身上的差事(信/铁盒)。需要在收信地附近(5km)。"""
-    return deliver_impl()
+async def deliver() -> dict:
+    """送达身上的差了保铁盒)。需要在收信地附近5km)。"""
+    return await _run_serialized(deliver_impl)
 
 
 def deliver_impl() -> dict:
@@ -6091,8 +6165,8 @@ def deliver_impl() -> dict:
         sender = _state.errand.get("sender", "无名")
         recipient = _state.errand.get("recipient_desc", "")
         text = (
-            f"你把信交给了{matched}的人。「{sender}托的。」"
-            f"对方接过信,点了点头。"
+            f"你把信交给了{matched}的人。「{sender}托的。。"
+            f"对方接过保点了点头。"
             f"\n{journal_entry}"
         )
         _state.errand = None
@@ -6150,13 +6224,13 @@ def postcards() -> dict:
 
 @mcp.tool()
 async def walk_to(place: str) -> dict:
-    """朝一个命名地点走过去(山/河/城/古迹)。探索从此有方向。"""
+    """朝一个命名地点走过去(山河城古迹)。探索从此有方向。"""
     return await walk_to_impl(place)
 
 
 @mcp.tool()
 def journeys_list() -> dict:
-    """看看以前的旅程。每段旅程,一个世界。"""
+    """看看以前的旅程。每段旅程一个世界。"""
     js = journeys.list_journeys()
     if not js:
         return {"text": "还没有旧旅程。第一次开门才算。", "data": {"journeys": []}}
@@ -6171,7 +6245,7 @@ def journeys_list() -> dict:
 
 @mcp.tool()
 def atlas() -> dict:
-    """看看你去过哪些地方。世界迷雾,一点一点亮起来。"""
+    """看看你去过哪些地方。世界迷雨一点一点亮起来。"""
     result = journeys.atlas()
     if result["places"] == 0:
         return {"text": "还没出门过。", "data": result}
@@ -6195,13 +6269,13 @@ def atlas() -> dict:
 
 @mcp.tool()
 async def wait(hours: float = 1.0) -> dict:
-    """原地待着,让时间流过去(0.25-12 小时)。天黑温降,城会换班。"""
+    """原地待着,让时间流过去(0.25-12 小时)。天黑温附城会换班。"""
     return await wait_impl(hours)
 
 
 @mcp.tool()
 def look(direction: str = "前") -> dict:
-    """朝一个方向看。不动位置,不计时。给方位:左/右/前/后 或 N/NE/E/SE/S/SW/W/NW。"""
+    """朝一个方向看。不动位置,不计时。给方位:前后左右或 N/NE/E/SE/S/SW/W/NW。"""
     return look_impl(direction)
 
 
@@ -6260,9 +6334,9 @@ def look_impl(direction: str) -> dict:
 
     # Elevation trend
     if samples[2]["elevation"] > samples[0]["elevation"] + 200:
-        parts.append("地势在升高")
+        parts.append("地势在升高。")
     elif samples[2]["elevation"] < samples[0]["elevation"] - 200:
-        parts.append("地势在走低")
+        parts.append("地势在下降。")
 
     # Card 66: festival atmosphere in look
     _now_look = _state.now()
@@ -6272,9 +6346,9 @@ def look_impl(direction: str) -> dict:
     if _fest_ctx:
         _fk = _fest_ctx.get("keywords", [])
         if _fk:
-            parts.append(f"空气里有{_fk[0]}的痕迹")
+            parts.append(f"空气里有{_fk[0]}的痕迹。")
 
-    text = "，".join(parts) + "。"
+    text = "；".join(parts) + "。"
 
     # Direction label for response
     _DIR_ZH = {0: "北", 45: "东北", 90: "东", 135: "东南", 180: "南", 225: "西南", 270: "西", 315: "西北"}
@@ -6287,9 +6361,9 @@ def look_impl(direction: str) -> dict:
 
 
 @mcp.tool()
-def say(text: str) -> dict:
+async def say(text: str) -> dict:
     """说一句话。世界会记住。"""
-    return say_impl(text)
+    return await _run_serialized(say_impl, text)
 
 
 def say_impl(text: str) -> dict:
@@ -6337,19 +6411,19 @@ def quotes() -> dict:
     for q in _state.quotes:
         place = q.get("place", "")
         t = q.get("text", "")
-        parts.append(f"「{t}」——{place}" if place else f"「{t}」")
-    text = f"本旅程说了 {len(_state.quotes)} 句话。\n" + "\n".join(parts)
+        parts.append(f"「{t}」——{place}" if place else f"「{t}。")
+    text = f"本旅程说了{len(_state.quotes)} 句话。\n" + "\n".join(parts)
     return {"text": text, "data": {"quotes": _state.quotes}}
 
 
 @mcp.tool()
-def talk(question: str | None = None) -> dict:
-    """和最近遇见的人搭话。不传参数=最近的人说下一句;传路怎么走=问路。"""
-    return talk_impl(question)
+async def talk(question: str | None = None) -> dict:
+    """和最近遇见的人搭话。不传参教最近的人说下一口传路怎么走问路。"""
+    return await _run_serialized(talk_impl, question)
 
 
 def talk_impl(question: str | None = None) -> dict:
-    """搭话。lines 轮换,第四句是记得你变体。question 含路/方向 → knows。"""
+    """搭话。lines 轮换,第四句是记得你变体。question 含路/方向 ↀknows。"""
     if _state.pos is None:
         return {"text": "还没开门呢。先开门吧。", "data": {"error": "not_landed"}}
     if _state.last_person is None:
@@ -6364,25 +6438,25 @@ def talk_impl(question: str | None = None) -> dict:
     # Only advance line count if it wasn't a knows-type question
     is_knows = question and any(k in question for k in (
         "路", "怎么走", "方向", "在哪", "哪里",
-        "节日", "节", "传言", "风声", "传闻", "听说",
+        "节日", "节庆", "传言", "风声", "传闻", "听说",
     ))
     # ── Card 43: people notebook hook (first successful talk) ───────
     _nb_first_talk = (_state.talk_count == 0)
     if not is_knows:
         _state.talk_count += 1
 
-    # Card 42: rumor-based letter pickup — person with knows.rumor mentioning 信
+    # Card 42: rumor-based letter pickup  person with knows.rumor mentioning 保
     knows = entry.get("knows", {})
     if (knows.get("type") == "rumor"
-            and question and any(k in question for k in ("信", "带", "邮", "差事"))
+            and question and any(k in question for k in ("包裹", "市场", "那边", "差事"))
             and not _state.errand
             and not _state.errand_letter_taken_this_journey):
-        _llat, _llon = _state.pos if _state.pos else (0.0, 0.0)
+        _llat, _llon = _state.pos if _state.pos else (None, None)
         letter = errands.pick_letter(_rng, listener_lat=_llat, listener_lon=_llon)
         if letter:
             _state.errand = errands.take_letter(letter, _state.now() or datetime.now(timezone.utc))
             _state.errand_letter_taken_this_journey = True
-            reply += f"\n「对了,这里有封信。{letter['sender']}托的,给{letter['recipient']}。你顺路就带一趟。」你把信接了过来。"
+            reply += f"\n「对了这里有封信。{letter['sender']}托的,给{letter['recipient']}。你顺路就带一趟。」你把信接了过来。"
 
     # ── Card 43: people notebook hook (record on first talk) ───────
     if _nb_first_talk:
@@ -6436,10 +6510,10 @@ def journal() -> dict:
 
 @mcp.tool()
 def notebook(volume: str | None = None) -> dict:
-    """旅行手账——五册自然志(植物/动物/电台/水文/人物)。
+    """旅行手账——五册自然志(植物/动物/电台/水文/人物)。"
 
-    不传参数: 列出所有册概况。
-    传册名(flora/fauna/radio/water/people): 指定册全列。
+    不传参数: 列出所有册概况。"
+    传册后flora/fauna/radio/water/people): 指定册全列。"
     """
     try:
         text = notebook_mod.notebook(volume)
@@ -6449,37 +6523,39 @@ def notebook(volume: str | None = None) -> dict:
 
 
 @mcp.tool()
-def walk_alone() -> dict:
-    """本次旅程屏蔽同游者文案。注册表保留,标记独行。下次 open_door 恢复。"""
-    if not travelers_mod.is_enabled():
-        return {"text": "同游者功能没有开。", "data": {"enabled": False}}
-    current = travelers_mod.walk_alone_active(_state)
-    if current:
-        return {"text": "已经在独行了。", "data": {"alone": True}}
-    travelers_mod.set_walk_alone(_state, True)
-    _state.save()
-    return {
-        "text": "独行了。这一路上不会再看到别人的痕迹。",
-        "data": {"alone": True},
-    }
+async def walk_alone() -> dict:
+    """本次旅程屏蔽同游者文案。注册表保留,标记独行。下次open_door 恢复。"""
+    def _impl() -> dict:
+        if not travelers_mod.is_enabled():
+            return {"text": "同游者功能没有开。", "data": {"enabled": False}}
+        current = travelers_mod.walk_alone_active(_state)
+        if current:
+            return {"text": "已经在独行了。", "data": {"alone": True}}
+        travelers_mod.set_walk_alone(_state, True)
+        _state.save()
+        return {
+            "text": "独行了。这一路上不会再看到别人的痕迹。",
+            "data": {"alone": True},
+        }
+    return await _run_serialized(_impl)
 
 
 # ── Card 16: Blind door tools ────────────────────────────────────────
 
 _REVEAL_VARIANTS = {
     "correct": [
-        "对,就是{place}。",
+        "寺就是{place}。",
         "没错,这里就是{place}。",
         "你猜对了。{place}。",
         "是{place}。你认出来了。",
     ],
     "wrong_clue": [
         "不对。给你个线索:这里在{clue}。",
-        "猜错了。提示一下:这片地方属于{clue}。",
+        "猜错了。提示一一这片地方属于{clue}。",
         "不是。想想看,{clue}。",
     ],
     "give_up": [
-        "是{place}。你走了这么远,总算知道了。",
+        "是{place}。你走了这么过总算知道了。",
         "放弃也好。这里是{place}。",
         "{place}。答案一直在你脚下。",
         "这里就是{place}。你已经在这里走过了。",
@@ -6506,8 +6582,8 @@ def _get_blind_clue(lat: float, lon: float, clue_level: int) -> str:
             "PT": "欧洲", "NL": "欧洲", "SE": "欧洲", "NO": "欧洲", "FI": "欧洲",
             "PL": "欧洲", "CZ": "欧洲", "GR": "欧洲", "AT": "欧洲", "CH": "欧洲",
             "RU": "欧洲", "UA": "欧洲",
-            "US": "北美洲", "CA": "北美洲", "MX": "北美洲",
-            "BR": "南美洲", "AR": "南美洲", "CL": "南美洲", "CO": "南美洲", "PE": "南美洲",
+            "US": "北美洲",  "CA": "北美洲",  "MX": "北美洲",
+            "BR": "南美洲",  "AR": "南美洲",  "CL": "南美洲",  "CO": "南美洲",  "PE": "南美洲",
             "EG": "非洲", "ZA": "非洲", "NG": "非洲", "KE": "非洲", "MA": "非洲", "ET": "非洲",
             "AU": "大洋洲", "NZ": "大洋洲",
         }
@@ -6529,66 +6605,69 @@ def _get_blind_clue(lat: float, lon: float, clue_level: int) -> str:
 
 
 @mcp.tool()
-def guess(place: str) -> dict:
-    """盲开模式下猜地名。猜对揭晓,猜错给线索。"""
-    global _state
-    if not getattr(_state, "blind", False):
-        return {"text": "现在不是盲开模式。", "data": {"error": "not_blind"}}
-    if _state.pos is None:
-        return {"text": "还没开门呢。", "data": {"error": "not_landed"}}
+async def guess(place: str) -> dict:
+    """盲开模式下猜地名。猜对揭晚猜错给线索。"""
+    def _impl() -> dict:
+        global _state
+        if not getattr(_state, "blind", False):
+            return {"text": "现在不是盲开模式。", "data": {"error": "not_blind"}}
+        if _state.pos is None:
+            return {"text": "还没开门呢。", "data": {"error": "not_landed"}}
 
-    lat, lon = _state.pos
-    actual_place = _state.place_name or ""
-    guess_norm = place.strip().lower()
-    actual_norm = actual_place.strip().lower()
+        lat, lon = _state.pos
+        actual_place = _state.place_name or ""
+        guess_norm = place.strip().lower()
+        actual_norm = actual_place.strip().lower()
 
-    # Check if guess matches place name or country
-    cc = country.country_code_of(lat, lon)
-    country_zh = _COUNTRY_ZH.get(cc, "")
+        # Check if guess matches place name or country
+        cc = country.country_code_of(lat, lon)
+        country_zh = _COUNTRY_ZH.get(cc, "")
 
-    # Match: exact place name, or country name if guess is country
-    matched = (guess_norm == actual_norm) or (guess_norm and actual_norm and guess_norm in actual_norm)
-    if not matched and country_zh:
-        matched = guess_norm == country_zh.lower() or guess_norm == cc.lower()
+        # Match: exact place name, or country name if guess is country
+        matched = (guess_norm == actual_norm) or (guess_norm and actual_norm and guess_norm in actual_norm)
+        if not matched and country_zh:
+            matched = guess_norm == country_zh.lower() or guess_norm == cc.lower()
 
-    if matched:
-        _state.blind = False
-        _state.save()
-        placememory.save_revealed_place(actual_place)
-        text = _rng.choice(_REVEAL_VARIANTS["correct"]).format(place=actual_place)
-        return {"text": text, "data": {"revealed": True, "place": actual_place, "method": "correct"}}
-    else:
-        _state.blind_clues = getattr(_state, "blind_clues", 0) + 1
-        if _state.blind_clues >= 4:
-            # Give up after 4 wrong guesses
+        if matched:
             _state.blind = False
             _state.save()
             placememory.save_revealed_place(actual_place)
-            text = _rng.choice(_REVEAL_VARIANTS["far"]).format(place=actual_place)
-            return {"text": text, "data": {"revealed": True, "place": actual_place, "method": "far"}}
+            text = _rng.choice(_REVEAL_VARIANTS["correct"]).format(place=actual_place)
+            return {"text": text, "data": {"revealed": True, "place": actual_place, "method": "correct"}}
         else:
-            clue_level = min(2, _state.blind_clues - 1)
-            clue = _get_blind_clue(lat, lon, clue_level)
-            _state.save()
-            text = _rng.choice(_REVEAL_VARIANTS["wrong_clue"]).format(clue=clue)
-            return {"text": text, "data": {"revealed": False, "clue": clue, "clue_level": clue_level}}
+            _state.blind_clues = getattr(_state, "blind_clues", 0) + 1
+            if _state.blind_clues >= 4:
+                # Give up after 4 wrong guesses
+                _state.blind = False
+                _state.save()
+                placememory.save_revealed_place(actual_place)
+                text = _rng.choice(_REVEAL_VARIANTS["far"]).format(place=actual_place)
+                return {"text": text, "data": {"revealed": True, "place": actual_place, "method": "far"}}
+            else:
+                clue_level = min(2, _state.blind_clues - 1)
+                clue = _get_blind_clue(lat, lon, clue_level)
+                _state.save()
+                text = _rng.choice(_REVEAL_VARIANTS["wrong_clue"]).format(clue=clue)
+                return {"text": text, "data": {"revealed": False, "clue": clue, "clue_level": clue_level}}
+    return await _run_serialized(_impl)
 
 
 @mcp.tool()
-def reveal() -> dict:
-    """盲开模式下认输,直接揭晓地名。"""
-    global _state
-    if not getattr(_state, "blind", False):
-        return {"text": "现在不是盲开模式。", "data": {"error": "not_blind"}}
-    if _state.pos is None:
-        return {"text": "还没开门呢。", "data": {"error": "not_landed"}}
+async def reveal() -> dict:
+    """盲开模式下认边直接揭晓地名。"""
+    def _impl() -> dict:
+        if not getattr(_state, "blind", False):
+            return {"text": "现在不是盲开模式。", "data": {"error": "not_blind"}}
+        if _state.pos is None:
+            return {"text": "还没开门呢。", "data": {"error": "not_landed"}}
 
-    actual_place = _state.place_name or "未知之地"
-    _state.blind = False
-    _state.save()
-    placememory.save_revealed_place(actual_place)
-    text = _rng.choice(_REVEAL_VARIANTS["give_up"]).format(place=actual_place)
-    return {"text": text, "data": {"revealed": True, "place": actual_place, "method": "give_up"}}
+        actual_place = _state.place_name or "未知之地"
+        _state.blind = False
+        _state.save()
+        placememory.save_revealed_place(actual_place)
+        text = _rng.choice(_REVEAL_VARIANTS["give_up"]).format(place=actual_place)
+        return {"text": text, "data": {"revealed": True, "place": actual_place, "method": "give_up"}}
+    return await _run_serialized(_impl)
 
 
 # ── Card 18: Drift card tool ────────────────────────────────────────
@@ -6608,35 +6687,36 @@ def _load_drift_cards() -> dict:
 
 
 @mcp.tool()
-def drift() -> dict:
+async def drift() -> dict:
     """抽一张漂流卡,给个方向建议。脚是你的。"""
-    global _state
-    if _state.pos is None:
-        return {"text": "还没开门呢。先开门吧。", "data": {"error": "not_landed"}}
+    def _impl() -> dict:
+        if _state.pos is None:
+            return {"text": "还没开门呢。先开门吧。", "data": {"error": "not_landed"}}
 
-    data = _load_drift_cards()
-    biome = getattr(_state, "biome", None) or "any"
-    pool = data.get(biome, data.get("any", []))
-    if not pool:
-        return {"text": "这里没有方向。", "data": {"error": "no_cards"}}
+        data = _load_drift_cards()
+        biome = getattr(_state, "biome", None) or "any"
+        pool = data.get(biome, data.get("any", []))
+        if not pool:
+            return {"text": "这里没有方向。", "data": {"error": "no_cards"}}
 
-    # Per-journey dedup
-    drift_seen = set(getattr(_state, "drift_seen", []))
-    available = [c for c in pool if c["text"] not in drift_seen]
-    if not available:
-        # All seen in this biome, try "any"
-        available = [c for c in data.get("any", []) if c["text"] not in drift_seen]
-    if not available:
-        return {"text": "方向都试过了。", "data": {"error": "all_seen"}}
+        # Per-journey dedup
+        drift_seen = set(getattr(_state, "drift_seen", []))
+        available = [c for c in pool if c["text"] not in drift_seen]
+        if not available:
+            # All seen in this biome, try "any"
+            available = [c for c in data.get("any", []) if c["text"] not in drift_seen]
+        if not available:
+            return {"text": "方向都试过了。", "data": {"error": "all_seen"}}
 
-    card = _rng.choice(available)
-    _state.drift_seen = list(drift_seen | {card["text"]})
-    _state.save()
+        card = _rng.choice(available)
+        _state.drift_seen = list(drift_seen | {card["text"]})
+        _state.save()
 
-    return {
-        "text": card["text"],
-        "data": {"action": card.get("action"), "biome": biome},
-    }
+        return {
+            "text": card["text"],
+            "data": {"action": card.get("action"), "biome": biome},
+        }
+    return await _run_serialized(_impl)
 
 
 def _log_journey_event(kind: str, summary: str) -> None:
@@ -6675,7 +6755,7 @@ def main() -> None:
         const=0,
         type=int,
         default=None,
-        help="启动网页旁观者 (不给端口=自动选端口；--web 8080=指定端口)",
+        help="启动网页旁观老(不给端口=自动选端口；--web 8080=指定端口)",
     )
     parser.add_argument("--web-only", type=int, default=None, help="Web observer port (standalone, no MCP)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Bind host (127.0.0.1=localhost only, 0.0.0.0=all interfaces)")
@@ -6722,7 +6802,7 @@ def main() -> None:
         # receives it during the initialize handshake and can tell the user.
         mcp.instructions = (
             f"网页旁观者已启动：{web_url}\n"
-            "你可以告诉用户在浏览器打开这个地址，实时观看你在地球上的行走、"
+            "你可以告诉用户在浏览器打开这个地址，实时观看你在地球上的行走。"
             "查看地图位置和身体状态，还能在明信片下留言。"
         )
         print(f"[nowhere] web observer ready: {web_url}", file=_sys.stderr)

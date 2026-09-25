@@ -15,7 +15,6 @@ from typing import Final
 _DATA_DIR = pathlib.Path(__file__).resolve().parent / "data"
 
 _FALLBACK_PATH: Final = _DATA_DIR / "radio_fallback.json"
-_EARTH_RADIUS_KM: Final = 6371.0
 
 # 统一引用 describe 的权威定义，消除重复映射
 from nowhere.describe import _SURFACE_ZH
@@ -52,7 +51,6 @@ def describe_sound(env: dict, rng: random.Random) -> str:
 
     # 降水压过一切
     if precip == "rain":
-        target = _SURFACE_SOUND.get(surface, "地")
         sounds.append(rng.choice([
             "雨声。雨点砸下来,把别的声音都盖住了。",
             f"雨一阵密一阵疏,落在{_SURFACE_ZH.get(surface, '地面')}上。",
@@ -128,6 +126,7 @@ def dawn_chorus(biome: str, sun_alt: float, rng: random.Random) -> str | None:
 
     Intensity maps to sun_alt position: -6→first(一只), -0→last(满).
     Biome picks forest/city/water group; fallback to city.
+    结果是确定性的(rng 未使用, 保留形参以兼容调用方签名)。
     """
     if sun_alt < -6.0 or sun_alt > 0.0:
         return None
@@ -137,9 +136,10 @@ def dawn_chorus(biome: str, sun_alt: float, rng: random.Random) -> str | None:
     pool = data.get(group_key, data.get("city", []))
     if not pool:
         return None
-    # map sun_alt to index: -6→0, -0→3
+    # map sun_alt to index: -6→0, 0→末条; 按 len(pool) 钳制, 分组数据
+    # 少于 4 条时不会 IndexError
     t = (sun_alt + 6.0) / 6.0  # 0..1
-    idx = min(3, int(t * 4))
+    idx = min(len(pool) - 1, int(t * len(pool)))
     return pool[idx]
 
 
@@ -175,8 +175,8 @@ _BIOME_CREDIT_MAP: dict[str, str] = {
 def soundscape_credit(
     biome: str,
     rng: random.Random,
-    listener_lat: float = 0.0,
-    listener_lon: float = 0.0,
+    listener_lat: float | None = None,
+    listener_lon: float | None = None,
 ) -> str | None:
     """20% chance to return a soundscape credit line matching biome.
 
@@ -195,7 +195,7 @@ def soundscape_credit(
         return None
 
     # Distance filter: exclude entries >200 km from listener
-    if listener_lat != 0.0 or listener_lon != 0.0:
+    if listener_lat is not None or listener_lon is not None:
         near_pool = []
         for entry in pool:
             elat = entry.get("lat")
@@ -205,9 +205,6 @@ def soundscape_credit(
                 near_pool.append(entry)
             elif _haversine_km(listener_lat, listener_lon, elat, elon) <= 200:
                 near_pool.append(entry)
-        if not pool:
-            # No entries at all — silent
-            return None
         if near_pool:
             pool = near_pool
         else:

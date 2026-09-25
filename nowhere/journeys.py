@@ -7,12 +7,16 @@ An index.json tracks the active journey and metadata for all journeys.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import re
+import tempfile
 from datetime import datetime, timezone
 
 from nowhere.state import WorldState
+
+logger = logging.getLogger(__name__)
 
 _CONTINENT_MAP: dict[str, str] = {
     # Asia
@@ -64,8 +68,8 @@ _INDEX_FILE = _JOURNEYS_DIR / "index.json"
 def _slug(place_name: str, force_new: bool = False) -> str:
     """Normalize place name to a filesystem-safe slug.
 
-    Card 82: if force_new=True and the slug already exists in the index,
-    append a numeric suffix (-2, -3, ...) to avoid collision.
+    Card 82: if force_new=True and the slug already exists in the index
+    (or on disk), append a numeric suffix (-2, -3, ...) to avoid collision.
     """
     s = place_name.strip().lower()
     s = re.sub(r"\s+", "_", s)
@@ -73,13 +77,14 @@ def _slug(place_name: str, force_new: bool = False) -> str:
     base = s or "unknown"
     if not force_new:
         return base
-    # Check index for existing slug
+    # Check index AND disk: 索引可能损坏/落后于磁盘(手工放入的文件、被重建),
+    # 只查索引会让"强制新建"静默覆盖已存在的 <base>.json
     index = _load_index()
-    existing_slugs = {j["slug"] for j in index.get("journeys", [])}
-    if base not in existing_slugs:
+    existing_slugs = {j.get("slug") for j in index.get("journeys", [])}
+    if base not in existing_slugs and not _journey_path(base).exists():
         return base
     n = 2
-    while f"{base}-{n}" in existing_slugs:
+    while f"{base}-{n}" in existing_slugs or _journey_path(f"{base}-{n}").exists():
         n += 1
     return f"{base}-{n}"
 
@@ -88,22 +93,102 @@ def _ensure_dir() -> None:
     _JOURNEYS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _default_index() -> dict:
+    return {"active": None, "journeys": []}
+
+
+def _rebuild_index_from_disk() -> dict:
+    """扫描旅程目录, 尽力重建索引条目(元数据以文件内容为准)。"""
+    index = _default_index()
+    if not _JOURNEYS_DIR.exists():
+        return index
+    best: tuple[str, int] | None = None
+    for p in sorted(_JOURNEYS_DIR.glob("*.json")):
+        slug = p.stem
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            steps = len(data.get("path") or [])
+        except TypeError:
+            steps = 0
+        landed_at = data.get("landed_at")
+        index["journeys"].append({
+            "slug": slug,
+            "place_name": data.get("place_name") or slug,
+            "landed_at": landed_at if isinstance(landed_at, str) else "",
+            "last_active": "",
+            "departed_at": "",
+            "steps": steps,
+            "last_text": (data.get("last_text") or "")[:50],
+        })
+        if best is None or steps > best[1]:
+            best = (slug, steps)
+    if best is not None:
+        index["active"] = best[0]
+    return index
+
+
 def _load_index() -> dict:
-    """Load or initialize the journey index."""
+    """Load or initialize the journey index.
+
+    损坏时先把原文件改名 .bak 留证, 再从磁盘旅程文件重建 —— 直接返回空索引
+    会让下一次 _save_index 用单条记录整体覆盖, 全部旅程元数据不可恢复。
+    """
     if _INDEX_FILE.exists():
         try:
-            return json.loads(_INDEX_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass  # intentionally ignored: corrupt index file, will reinitialize
-    return {"active": None, "journeys": []}
+            data = json.loads(_INDEX_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("journeys"), list):
+            # 归一化: 只信 dict/list 形状, 消费端不必各自容错
+            data["journeys"] = [
+                j for j in data["journeys"]
+                if isinstance(j, dict) and isinstance(j.get("slug"), str)
+            ]
+            if not isinstance(data.get("active"), (str, type(None))):
+                data["active"] = None
+            return data
+        try:
+            _INDEX_FILE.replace(_INDEX_FILE.with_name("index.json.bak"))
+        except OSError as exc:
+            logger.warning("损坏的 index.json 改名备份失败: %s", exc)
+        logger.warning("index.json 损坏, 已备份为 index.json.bak 并从磁盘重建索引")
+        return _rebuild_index_from_disk()
+    return _default_index()
+
+
+def _atomic_write_text(path: pathlib.Path, text: str) -> None:
+    """同目录写临时文件后 os.replace 原子替换, 防止半截 JSON 落盘。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)  # fdopen 失败时 fd 未移交, 显式关闭防泄漏
+            raise
+        with f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass  # 清理失败不许遮蔽原始异常
+        raise
 
 
 def _save_index(index: dict) -> None:
     """Persist the journey index."""
-    _ensure_dir()
-    _INDEX_FILE.write_text(
+    _atomic_write_text(
+        _INDEX_FILE,
         json.dumps(index, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
 
 
@@ -123,15 +208,20 @@ def save_current(state: WorldState, force_new: bool = False) -> None:
     if getattr(state, "force_new_slug", False):
         force_new = True
         state.force_new_slug = False  # consume the flag
-    slug = _slug(place, force_new=force_new)
+    # 优先用 state 上持久化的所属 slug: 带后缀的旅程(上海-2)若每次都从
+    # place_name 重新推导, force_new 标志只消费一次, 之后会回落到"上海"
+    # 并覆盖同名旧旅程的文件与索引
+    persisted_slug = getattr(state, "journey_slug", None)
+    if persisted_slug and not force_new:
+        slug = persisted_slug
+    else:
+        slug = _slug(place, force_new=force_new)
+    state.journey_slug = slug
     path = _journey_path(slug)
 
     # Save state
     data = state.to_dict()
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
 
     # Update index
     index = _load_index()
@@ -226,36 +316,55 @@ def _load_journey(slug: str, index: dict) -> WorldState | None:
     path = _journey_path(slug)
     if not path.exists():
         return None
+    # 只把"文件解析/反序列化失败"折叠成 None; 索引写盘错误不在此列,
+    # 否则磁盘满/权限问题会被调用方误判为"旅程不存在"而走新建落地
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         state = WorldState.from_dict(data)
-        # Validate: loaded state's place must match index entry
-        expected_place = None
-        for j in index.get("journeys", []):
-            if j["slug"] == slug:
-                expected_place = j.get("place_name", "")
-                break
-        if expected_place and state.place_name:
-            if _slug(state.place_name) != _slug(expected_place):
-                return None  # cross-contamination detected
-        index["active"] = slug
-        _save_index(index)
-        return state
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError, TypeError) as exc:
+        logger.warning("旅程 %s 加载失败: %s", slug, exc)
         return None
+    # 无条件比较: 空值双方经 _slug 都归一为 'unknown', 天然一致不误报;
+    # 原"任一侧为空就跳过校验"恰好放过了被覆盖成空地名的旅程文件
+    expected_place = ""
+    for j in index.get("journeys", []):
+        if j.get("slug") == slug:
+            expected_place = j.get("place_name", "") or ""
+            break
+    if _slug(state.place_name or "unknown") != _slug(expected_place or "unknown"):
+        return None  # cross-contamination detected
+    state.journey_slug = slug
+    index["active"] = slug
+    _save_index(index)
+    return state
+
+
+_SLUG_SAFE_RE = re.compile(r"[\w\u4e00-\u9fff-]+")
 
 
 def delete(slug: str) -> bool:
-    """Delete a journey file. Returns True if deleted."""
+    """Delete a journey file.
+
+    Returns True only if a file was actually deleted; False when the slug
+    is illegal (可能携带路径) or the journey file did not exist.
+    """
+    # 本模块唯一绕过 _slug() 白名单的入口, 校验后再拼路径, 防 '../../x'
+    # 之类输入拼出 journeys 目录之外的文件路径
+    if not re.fullmatch(_SLUG_SAFE_RE, slug):
+        return False
     path = _journey_path(slug)
+    deleted = False
     if path.exists():
         path.unlink()
+        deleted = True
     index = _load_index()
-    index["journeys"] = [j for j in index["journeys"] if j["slug"] != slug]
-    if index["active"] == slug:
+    index["journeys"] = [
+        j for j in index.get("journeys", []) if j.get("slug") != slug
+    ]
+    if index.get("active") == slug:
         index["active"] = None
     _save_index(index)
-    return True
+    return deleted
 
 
 def atlas() -> dict:

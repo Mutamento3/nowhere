@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 import random as _random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import ephem
 
@@ -28,7 +28,10 @@ _PLANETS = [
 # ── helpers ─────────────────────────────────────────────────────────
 
 def _make_observer(lat: float, lon: float, dt: datetime) -> ephem.Observer:
-    """Build an ephem Observer from decimal lat/lon and a tz-aware datetime."""
+    """Build an ephem Observer from decimal lat/lon and a tz-aware datetime.
+
+    naive datetime 一律按 UTC 解释(本文件所有公开函数同此约定)。
+    """
     obs = ephem.Observer()
     obs.lat = str(lat)
     obs.lon = str(lon)
@@ -73,17 +76,23 @@ def sun_moon(lat: float, lon: float, dt: datetime) -> dict:
     sun = ephem.Sun(obs)
     sun_alt = float(sun.alt) * 180.0 / math.pi
 
-    # sunrise / sunset for the local calendar day
+    # sunrise / sunset for the local calendar day: 围绕地方时正午(≈UTC
+    # 正午 − 经度/15 小时)重建 observer 后取 previous_rising/next_setting,
+    # 保证两个时刻同属 dt 的那一日; 直接对 dt 取最近事件会在午夜附近
+    # 一个来自昨日、一个来自明日
     sunrise_iso: str | None = None
     sunset_iso: str | None = None
     try:
-        sunrise_iso = _to_iso(obs.previous_rising(ephem.Sun()))
+        noon_obs = ephem.Observer()
+        noon_obs.lat = str(lat)
+        noon_obs.lon = str(lon)
+        utc_dt = dt.astimezone(timezone.utc)
+        noon = utc_dt + timedelta(hours=(12.0 - lon / 15.0))
+        noon_obs.date = noon.strftime("%Y/%m/%d %H:%M:%S")
+        sunrise_iso = _to_iso(noon_obs.previous_rising(ephem.Sun()))
+        sunset_iso = _to_iso(noon_obs.next_setting(ephem.Sun()))
     except (ephem.NeverUpError, ephem.AlwaysUpError):
         pass  # intentionally ignored: polar regions where sun never rises/sets is normal
-    try:
-        sunset_iso = _to_iso(obs.next_setting(ephem.Sun()))
-    except (ephem.NeverUpError, ephem.AlwaysUpError):
-        pass  # intentionally ignored: polar regions where sun never sets is normal
 
     # ── moon ────────────────────────────────────────────────────────
     moon = ephem.Moon(obs)
@@ -167,7 +176,7 @@ def visible_sky(lat: float, lon: float, dt: datetime, rng: _random.Random | None
             else:
                 shape = "diffuse"
             # Intensity 1-5 (Kp-like, affects brightness and movement)
-            intensity = min(5, max(1, int(_rng.triangular(1, 5, 2.5))))
+            intensity = min(5, max(1, round(_rng.triangular(1, 5, 2.5))))
             aurora_info = {
                 "color": color,
                 "shape": shape,
